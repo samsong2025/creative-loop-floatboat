@@ -1,0 +1,21 @@
+{
+  "brand_id": "tiktok-videos-shop-live",
+  "product_name": "TikTok - Videos, Shop & LIVE",
+  "app_title": "TikTok - Videos, Shop & LIVE",
+  "package_names": [
+    "com.zhiliaoapp.musically"
+  ],
+  "aliases": [
+    "TikTok - Videos, Shop & LIVE"
+  ],
+  "icon": {},
+  "templates": {},
+  "detector_strategy": [
+    "icon_grayscale_match",
+    "edge_template_match",
+    "multi_scale_match",
+    "roi_ocr_confirmation"
+  ],
+  "registry_version": 1,
+  "updated_at": "2026-08-24T08:56:41.970171+00:00"
+}

@@ -1,0 +1,11 @@
+﻿Drop brand files here using these names when available:
+
+logo.png
+icon.png
+mid-promo.mp4
+end-card.mp4
+
+Alternative End Card image:
+end-card.png
+
+The API auto-discovers missing Brand Profile paths from this directory.

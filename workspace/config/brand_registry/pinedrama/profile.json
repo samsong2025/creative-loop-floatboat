@@ -1,0 +1,52 @@
+{
+  "brand_id": "pinedrama",
+  "product_name": "PineDrama",
+  "app_title": "PineDrama",
+  "package_names": [
+    "com.ss.android.ttmd.video"
+  ],
+  "aliases": [
+    "PineDrama"
+  ],
+  "icon": {
+    "relative_path": "config/brand_registry/pinedrama/source/icon.png",
+    "sha256": "ddeae0e1a5e55048b827161686577b8281c969caf8473a732eb09c2472601112",
+    "source_url": "https://adinsights-1258892624.oss-accelerate.aliyuncs.com/pkg_basic_update/logo/c07ae3342cd140e97c338f571d65e57c.png?Expires=1787576364&OSSAccessKeyId=LTAI5tHWzf4ZNhfdSN9byaJb&Signature=4YVjnsxhnH47nc65yq4fKgeP7z0%3D&x-oss-process=image%2Fresize%2Cl_96",
+    "source": "insight_app_record",
+    "size_bytes": 13866,
+    "updated_at": "2026-08-24T07:59:29.686684+00:00"
+  },
+  "templates": {
+    "generated_at": "2026-08-24T07:59:29.726870+00:00",
+    "version": 2,
+    "features_relative_path": "config/brand_registry/pinedrama/features.json",
+    "assets": {
+      "icon-gray.png": "config/brand_registry/pinedrama/templates/icon-gray.png",
+      "icon-edge.png": "config/brand_registry/pinedrama/templates/icon-edge.png",
+      "icon-edge-dilated.png": "config/brand_registry/pinedrama/templates/icon-edge-dilated.png",
+      "icon-32.png": "config/brand_registry/pinedrama/templates/icon-32.png",
+      "icon-48.png": "config/brand_registry/pinedrama/templates/icon-48.png",
+      "icon-64.png": "config/brand_registry/pinedrama/templates/icon-64.png",
+      "icon-96.png": "config/brand_registry/pinedrama/templates/icon-96.png"
+    },
+    "detector_assets": {
+      "grayscale": "config/brand_registry/pinedrama/templates/icon-gray.png",
+      "edge": "config/brand_registry/pinedrama/templates/icon-edge.png",
+      "edge_dilated": "config/brand_registry/pinedrama/templates/icon-edge-dilated.png",
+      "multi_scale_reference_sizes": [
+        32,
+        48,
+        64,
+        96
+      ]
+    }
+  },
+  "detector_strategy": [
+    "icon_grayscale_match",
+    "edge_template_match",
+    "multi_scale_match",
+    "roi_ocr_confirmation"
+  ],
+  "registry_version": 1,
+  "updated_at": "2026-08-24T07:59:29.731048+00:00"
+}

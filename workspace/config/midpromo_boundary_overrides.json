@@ -1,0 +1,13 @@
+{
+  "schema_version": 1,
+  "purpose": "User-confirmed source-specific Mid Promo boundaries. Entries create an auditable replacement action only for the matching immutable source SHA-256.",
+  "entries": [
+    {
+      "source_sha256": "23a6670d7f8f932358c8a19925e9fd183e21cc04848b44f1e515e6b180da82ab",
+      "start_seconds": 45.0,
+      "end_seconds": 67.0,
+      "reason": "User review confirmed the full-screen mid-promo range.",
+      "created_at": "2026-08-17T12:30:00+08:00"
+    }
+  ]
+}

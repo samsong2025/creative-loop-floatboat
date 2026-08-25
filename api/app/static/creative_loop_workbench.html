@@ -1,0 +1,275 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="color-scheme" content="dark" />
+  <title>Creative Loop｜Floatboat 工作台</title>
+  <style>
+    :root {
+      --ink: #ecf3ff;
+      --muted: #9aacc7;
+      --line: rgba(158, 186, 229, .16);
+      --panel: rgba(14, 27, 51, .78);
+      --panel-strong: #112546;
+      --surface: #071426;
+      --blue: #61a8ff;
+      --cyan: #61ead6;
+      --green: #70e59a;
+      --amber: #ffca68;
+      --red: #ff8494;
+      --shadow: 0 24px 70px rgba(0, 0, 0, .28);
+      font-family: Inter, "PingFang SC", "Microsoft YaHei", system-ui, sans-serif;
+    }
+    * { box-sizing: border-box; }
+    body { margin: 0; color: var(--ink); background: var(--surface); min-height: 100vh; }
+    body::before { content: ""; position: fixed; inset: 0; pointer-events: none; background: radial-gradient(circle at 8% -10%, rgba(48, 118, 255, .35), transparent 35%), radial-gradient(circle at 92% 8%, rgba(0, 222, 190, .18), transparent 28%), linear-gradient(120deg, #061021 0%, #0b1830 48%, #071426 100%); z-index: -2; }
+    body::after { content: ""; position: fixed; inset: 0; pointer-events: none; opacity: .13; background-image: linear-gradient(rgba(145, 199, 255, .16) 1px, transparent 1px), linear-gradient(90deg, rgba(145, 199, 255, .16) 1px, transparent 1px); background-size: 48px 48px; mask-image: linear-gradient(to bottom, black, transparent 76%); z-index: -1; }
+    .shell { max-width: 1480px; padding: 28px 30px 54px; margin: auto; }
+    .hero { display: flex; align-items: start; justify-content: space-between; gap: 24px; margin-bottom: 22px; }
+    .eyebrow { color: var(--cyan); font-size: 12px; font-weight: 800; letter-spacing: .16em; text-transform: uppercase; }
+    h1 { margin: 8px 0 9px; font-size: clamp(28px, 4vw, 44px); letter-spacing: -.055em; line-height: 1; }
+    .lead { color: var(--muted); max-width: 720px; line-height: 1.6; margin: 0; font-size: 14px; }
+    .header-actions { display: flex; gap: 10px; flex-wrap: wrap; justify-content: flex-end; }
+    .button, button { border: 1px solid var(--line); appearance: none; cursor: pointer; padding: 10px 14px; color: var(--ink); background: rgba(17, 37, 70, .78); border-radius: 10px; font: inherit; font-weight: 700; transition: transform .16s ease, border-color .16s ease, background .16s ease, opacity .16s ease; }
+    .button:hover, button:hover { transform: translateY(-1px); border-color: rgba(119, 179, 255, .7); background: rgba(35, 76, 139, .88); }
+    .button:disabled, button:disabled { cursor: wait; opacity: .55; transform: none; }
+    .button.primary { color: #03192b; background: linear-gradient(135deg, #6ee4d2, #6eaaff); border-color: transparent; }
+    .button.warn { color: #301400; background: var(--amber); border-color: transparent; }
+    .button.danger { color: #3a0610; background: var(--red); border-color: transparent; }
+    .status-row { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; margin-bottom: 20px; }
+    .status { display: flex; gap: 11px; min-height: 70px; align-items: center; padding: 14px; border: 1px solid var(--line); border-radius: 13px; background: rgba(13, 30, 56, .63); box-shadow: 0 10px 30px rgba(0,0,0,.12); }
+    .status-dot { width: 10px; height: 10px; border-radius: 100%; background: #56657b; box-shadow: 0 0 0 4px rgba(86, 101, 123, .12); flex: 0 0 auto; }
+    .status.ok .status-dot { background: var(--green); box-shadow: 0 0 0 4px rgba(112, 229, 154, .12); }
+    .status.warn .status-dot { background: var(--amber); box-shadow: 0 0 0 4px rgba(255, 202, 104, .13); }
+    .status.bad .status-dot { background: var(--red); box-shadow: 0 0 0 4px rgba(255, 132, 148, .13); }
+    .status strong, .status span { display: block; }
+    .status strong { font-size: 13px; }
+    .status span { color: var(--muted); font-size: 12px; margin-top: 3px; overflow-wrap: anywhere; }
+    .grid { display: grid; grid-template-columns: minmax(340px, .8fr) minmax(520px, 1.2fr); gap: 18px; align-items: start; }
+    .card { border: 1px solid var(--line); border-radius: 17px; background: linear-gradient(145deg, rgba(16, 35, 64, .88), rgba(8, 21, 41, .82)); box-shadow: var(--shadow); overflow: hidden; }
+    .card-heading { padding: 18px 20px 14px; display: flex; align-items: start; justify-content: space-between; gap: 14px; border-bottom: 1px solid var(--line); }
+    h2 { margin: 0; font-size: 16px; letter-spacing: -.02em; }
+    .sub { color: var(--muted); font-size: 12px; line-height: 1.45; margin-top: 5px; }
+    .card-body { padding: 20px; }
+    .mode-tabs { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-bottom: 18px; padding: 4px; border: 1px solid var(--line); border-radius: 12px; background: rgba(2, 11, 25, .45); }
+    .mode-tabs button { border: 0; background: transparent; font-size: 13px; }
+    .mode-tabs button.active { color: #06172c; background: linear-gradient(135deg, #6ee4d2, #7ab0ff); }
+    label { display: block; color: #d6e4f9; font-size: 12px; font-weight: 700; margin: 0 0 7px; }
+    input, textarea { display: block; width: 100%; color: var(--ink); font: inherit; font-size: 14px; border: 1px solid rgba(158, 186, 229, .21); background: rgba(2, 12, 29, .52); outline: none; border-radius: 10px; padding: 11px 12px; transition: border-color .15s ease, background .15s ease; }
+    input:focus, textarea:focus { border-color: var(--blue); background: rgba(5, 19, 43, .78); }
+    textarea { min-height: 112px; resize: vertical; line-height: 1.55; }
+    .fields { display: grid; gap: 14px; }
+    .two-cols { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+    .form-note { color: var(--muted); font-size: 12px; line-height: 1.55; margin: 12px 0 18px; }
+    .form-footer { display: flex; justify-content: space-between; align-items: center; gap: 12px; }
+    .gate { font-size: 11px; color: var(--cyan); max-width: 230px; line-height: 1.45; }
+    .empty { margin: 12px 0; border: 1px dashed rgba(158, 186, 229, .26); border-radius: 12px; padding: 24px 15px; color: var(--muted); text-align: center; font-size: 13px; }
+    .jobs { display: grid; gap: 12px; }
+    .job { border: 1px solid var(--line); border-radius: 13px; background: rgba(3, 15, 33, .32); overflow: hidden; }
+    .job-head { padding: 15px 15px 12px; display: flex; justify-content: space-between; align-items: flex-start; gap: 12px; }
+    .job-title { font-weight: 800; font-size: 14px; line-height: 1.4; }
+    .job-id { margin-top: 4px; color: var(--muted); font: 11px ui-monospace, SFMono-Regular, Consolas, monospace; }
+    .pill { border-radius: 99px; padding: 5px 8px; flex: 0 0 auto; font-size: 10px; line-height: 1; letter-spacing: .05em; font-weight: 900; background: rgba(150, 170, 202, .15); color: #bdcce2; }
+    .pill.awaiting_review { color: #2a1900; background: var(--amber); }
+    .pill.completed { color: #00311e; background: var(--green); }
+    .pill.failed, .pill.cancelled, .pill.interrupted { color: #3b0710; background: var(--red); }
+    .pill.processing, .pill.crawling, .pill.uploading, .pill.queued, .pill.cancel_requested { color: #041a35; background: var(--blue); }
+    .job-body { padding: 0 15px 15px; }
+    .progress-line { display: flex; justify-content: space-between; gap: 8px; color: var(--muted); font-size: 12px; margin: 5px 0 7px; }
+    .meter { overflow: hidden; height: 6px; border-radius: 10px; background: rgba(136, 161, 196, .16); }
+    .meter > i { display: block; width: 0; height: 100%; background: linear-gradient(90deg, var(--cyan), var(--blue)); border-radius: inherit; transition: width .35s ease; }
+    .job-actions { display: flex; gap: 8px; margin-top: 13px; flex-wrap: wrap; }
+    .job-actions button { padding: 7px 9px; font-size: 12px; }
+    .items { display: grid; gap: 12px; margin-top: 14px; }
+    .item { border-top: 1px solid var(--line); padding-top: 13px; }
+    .item-title { display: flex; justify-content: space-between; gap: 10px; font-size: 12px; font-weight: 800; }
+    .item-meta { display: flex; flex-wrap: wrap; gap: 7px; margin: 7px 0 10px; color: var(--muted); font-size: 11px; }
+    .item-meta b { color: var(--green); }
+    .provenance { display: grid; gap: 7px; margin: 10px 0 12px; padding: 10px; border: 1px solid rgba(158, 186, 229, .14); border-radius: 9px; background: rgba(2, 12, 29, .34); }
+    .provenance-row { display: grid; grid-template-columns: 74px minmax(0, 1fr); align-items: start; gap: 8px; color: var(--muted); font-size: 11px; line-height: 1.45; }
+    .provenance-row strong { color: #c8d9f2; font-size: 10px; letter-spacing: .04em; text-transform: uppercase; }
+    .provenance-row code { color: #8fbdf8; font: 11px ui-monospace, SFMono-Regular, Consolas, monospace; overflow-wrap: anywhere; }
+    .provenance-row a { color: var(--cyan); overflow-wrap: anywhere; text-decoration: none; }
+    .provenance-row a:hover { text-decoration: underline; }
+    video { width: 100%; max-height: 340px; display: block; border-radius: 10px; background: #000; border: 1px solid rgba(148, 183, 232, .2); }
+    .toast { position: fixed; right: 22px; bottom: 22px; width: min(420px, calc(100vw - 44px)); border: 1px solid var(--line); border-radius: 12px; padding: 14px 15px; background: rgba(8, 22, 43, .95); box-shadow: var(--shadow); color: var(--ink); font-size: 13px; line-height: 1.5; transform: translateY(140%); opacity: 0; transition: .25s ease; z-index: 20; }
+    .toast.visible { transform: translateY(0); opacity: 1; }
+    .toast.error { border-color: rgba(255, 132, 148, .55); }
+    .hidden { display: none !important; }
+    @media (max-width: 1000px) { .status-row { grid-template-columns: repeat(2, 1fr); } .grid { grid-template-columns: 1fr; } }
+    @media (max-width: 620px) { .shell { padding: 20px 15px 40px; } .hero { display: block; } .header-actions { justify-content: flex-start; margin-top: 16px; } .status-row, .two-cols { grid-template-columns: 1fr; } .form-footer { align-items: flex-start; flex-direction: column; } }
+  </style>
+</head>
+<body>
+  <main class="shell">
+    <header class="hero">
+      <div>
+        <div class="eyebrow">Floatboat · Professional Video Engine</div>
+        <h1>Creative Loop 工作台</h1>
+        <p class="lead">从素材检索到品牌处理、成片审核与上传，所有专业生产在本地 Creative Loop 引擎中运行；Floatboat 负责统一操作与关键确认。</p>
+      </div>
+      <div class="header-actions">
+        <button id="loginButton" type="button">启动 / 恢复 Insight 登录</button>
+        <button id="refreshButton" type="button" class="primary">刷新工作台</button>
+      </div>
+    </header>
+
+    <section class="status-row" aria-label="引擎状态">
+      <div class="status" id="engineStatus"><i class="status-dot"></i><div><strong>Creative Loop 引擎</strong><span>正在连接…</span></div></div>
+      <div class="status" id="insightStatus"><i class="status-dot"></i><div><strong>Insight</strong><span>正在检查…</span></div></div>
+      <div class="status" id="brandStatus"><i class="status-dot"></i><div><strong>品牌资产</strong><span>正在检查…</span></div></div>
+      <div class="status" id="mtgStatus"><i class="status-dot"></i><div><strong>Mintegral</strong><span>正在检查…</span></div></div>
+    </section>
+
+    <section class="grid">
+      <article class="card">
+        <div class="card-heading"><div><h2>新建生产任务</h2><div class="sub">选择一种素材来源。任务创建后会自动抓取、处理和执行本地 QC，完成后必须由你审核。</div></div></div>
+        <div class="card-body">
+          <div class="mode-tabs" role="tablist">
+            <button id="searchTab" class="active" type="button" role="tab" aria-selected="true">关键词搜索</button>
+            <button id="urlTab" type="button" role="tab" aria-selected="false">Insight 详情页链接</button>
+          </div>
+          <form id="jobForm" novalidate>
+            <div id="searchFields" class="fields">
+              <div><label for="keyword">搜索词</label><input id="keyword" maxlength="300" required placeholder="例如：狼人短剧 / CEO drama" /></div>
+              <div class="two-cols">
+                <div><label for="startDate">开始日期</label><input id="startDate" type="date" required /></div>
+                <div><label for="endDate">结束日期</label><input id="endDate" type="date" required /></div>
+              </div>
+              <div><label for="downloadCount">下载数量</label><input id="downloadCount" type="number" min="1" max="100" value="10" required /></div>
+            </div>
+            <div id="urlFields" class="fields hidden">
+              <div><label for="detailUrls">Insight 详情页链接</label><textarea id="detailUrls" placeholder="每行一个 https://data.insightrackr.com/creative/material/detail/... 链接"></textarea></div>
+            </div>
+            <p class="form-note">创建任务不会自动上传。所有渲染成片将在 <strong>等待审核</strong> 阶段停下，由你明确选择“通过并上传”或“拒绝上传”。</p>
+            <div class="form-footer"><span class="gate">✓ 本地路径与账号凭据不会进入 Floatboat 工作台</span><button id="submitButton" class="primary" type="submit">开始自动处理</button></div>
+          </form>
+        </div>
+      </article>
+
+      <article class="card">
+        <div class="card-heading"><div><h2>任务与审核</h2><div class="sub" id="jobCount">正在读取本地任务队列…</div></div></div>
+        <div class="card-body"><div id="jobs" class="jobs"><div class="empty">正在读取任务队列…</div></div></div>
+      </article>
+    </section>
+  </main>
+  <div id="toast" class="toast" role="status" aria-live="polite"></div>
+
+  <script>
+    (() => {
+      'use strict';
+      const API = '/agent/v1';
+      const state = { mode: 'search', timer: null, busy: false };
+      const $ = (id) => document.getElementById(id);
+      const escapeHtml = (value) => String(value ?? '').replace(/[&<>'"]/g, (char) => ({ '&':'&amp;', '<':'&lt;', '>':'&gt;', "'":'&#39;', '"':'&quot;' }[char]));
+      const dates = () => {
+        const end = new Date(); const start = new Date(); start.setDate(end.getDate() - 7);
+        const stamp = (date) => date.toISOString().slice(0, 10);
+        $('startDate').value = stamp(start); $('endDate').value = stamp(end);
+      };
+      const toast = (message, isError = false) => {
+        const node = $('toast'); node.textContent = message; node.classList.toggle('error', isError); node.classList.add('visible');
+        window.clearTimeout(node._timer); node._timer = window.setTimeout(() => node.classList.remove('visible'), 5200);
+      };
+      const request = async (path, options = {}) => {
+        const response = await fetch(`${API}${path}`, { headers: { 'Content-Type': 'application/json', ...(options.headers || {}) }, ...options });
+        const body = await response.json().catch(() => ({}));
+        if (!response.ok || body.ok === false) {
+          const detail = typeof body.detail === 'object' ? body.detail.error : body.detail;
+          throw new Error(detail || body.message || `请求失败（HTTP ${response.status}）`);
+        }
+        return body;
+      };
+      const setStatus = (id, ok, message, caution = false) => {
+        const node = $(id); node.classList.remove('ok', 'warn', 'bad'); node.classList.add(ok ? 'ok' : (caution ? 'warn' : 'bad'));
+        node.querySelector('span').textContent = message;
+      };
+      const badgeClass = (status) => String(status || '').toLowerCase();
+      const readableStatus = (status) => ({ QUEUED:'等待处理', CRAWLING:'正在采集', PROCESSING:'正在处理', UPLOADING:'正在上传', AWAITING_REVIEW:'等待审核', COMPLETED:'已完成', COMPLETED_WITH_ERRORS:'完成（含异常）', FAILED:'处理失败', CANCEL_REQUESTED:'正在取消', CANCELLED:'已取消', INTERRUPTED:'服务重启中断' }[status] || status || '未知');
+      const jobTitle = (job) => job.mode === 'search' ? (job.summary?.keyword || job.task_id) : (job.mode === 'url' ? 'Insight 详情页素材' : job.task_id);
+      const itemMarkup = (job, item) => {
+        const qc = item.business_qc_pass ? '<b>本地 QC：通过</b>' : '本地 QC：待确认';
+        const preview = item.preview_url ? `<video controls preload="metadata" src="${escapeHtml(item.preview_url)}"></video>` : '';
+        const sourcePath = item.source_reference?.label || '原片尚未归档';
+        const processedPath = item.processed_reference?.label || '剪辑成片尚未生成';
+        const detailUrl = item.source_reference?.detail_url || job.source_request?.detail_urls?.[0];
+        const sourceLink = detailUrl ? `<a href="${escapeHtml(detailUrl)}" target="_blank" rel="noopener noreferrer">查看 Insight 详情页 ↗</a>` : '<span>无可用详情页链接</span>';
+        const provenance = `<div class="provenance"><div class="provenance-row"><strong>原片地址</strong><code>${escapeHtml(sourcePath)}</code></div><div class="provenance-row"><strong>来源页面</strong>${sourceLink}</div><div class="provenance-row"><strong>剪辑成片</strong><code>${escapeHtml(processedPath)}</code></div></div>`;
+        return `<div class="item"><div class="item-title"><span>${escapeHtml(item.item_id || '素材')}</span><span>${escapeHtml(readableStatus(item.status))}</span></div><div class="item-meta"><span>${escapeHtml(item.source_product || '来源待解析')}</span><span>·</span><span>${escapeHtml(item.source_language || '语言待解析')}</span><span>·</span><span>${qc}</span></div>${provenance}${preview}</div>`;
+      };
+      const renderJobs = (jobs) => {
+        const root = $('jobs');
+        $('jobCount').textContent = jobs.length ? `共 ${jobs.length} 个任务，工作台每 8 秒自动刷新。` : '当前没有任务。创建第一个生产任务即可开始。';
+        if (!jobs.length) { root.innerHTML = '<div class="empty">还没有视频生产任务。<br>在左侧选择素材来源后开始处理。</div>'; return; }
+        root.innerHTML = jobs.map((job) => {
+          const progress = job.progress || {}; const percent = Math.max(0, Math.min(100, Number(progress.overall_percent || 0)));
+          const active = ['QUEUED','CRAWLING','PROCESSING','UPLOADING','CANCEL_REQUESTED'].includes(job.status);
+          const review = job.status === 'AWAITING_REVIEW';
+          const actions = `${review ? `<button class="warn" data-action="approve" data-job="${escapeHtml(job.task_id)}">通过并上传</button><button data-action="reject" data-job="${escapeHtml(job.task_id)}">拒绝上传</button>` : ''}${active ? `<button class="danger" data-action="cancel" data-job="${escapeHtml(job.task_id)}">取消任务</button>` : ''}`;
+          return `<section class="job"><div class="job-head"><div><div class="job-title">${escapeHtml(jobTitle(job))}</div><div class="job-id">${escapeHtml(job.task_id)}</div></div><span class="pill ${badgeClass(job.status)}">${escapeHtml(readableStatus(job.status))}</span></div><div class="job-body"><div class="progress-line"><span>${escapeHtml(job.stage_label || '正在准备')}</span><span>${percent}%</span></div><div class="meter"><i style="width:${percent}%"></i></div><div class="progress-line"><span>已下载 ${Number(progress.downloaded_count || 0)} · 已处理 ${Number(progress.processed_count || 0)}</span><span>目标 ${Number(progress.requested_count || 0)}</span></div><div class="job-actions">${actions}</div><div class="items">${(job.items || []).map((item) => itemMarkup(job, item)).join('')}</div></div></section>`;
+        }).join('');
+      };
+      const refresh = async (quiet = false) => {
+        try {
+          const [health, jobs] = await Promise.all([request('/health'), request('/jobs?limit=30')]);
+          setStatus('engineStatus', health.operator_ready, health.operator_ready ? '本地引擎已就绪' : '引擎未就绪');
+          setStatus('insightStatus', health.insight_logged_in, health.insight_logged_in ? '已登录' : '需要登录', true);
+          setStatus('brandStatus', health.brand_assets_ready, health.brand_assets_ready ? '品牌资产已就绪' : '品牌资产未就绪', !health.brand_assets_ready);
+          setStatus('mtgStatus', health.mintegral_ready, health.mintegral_ready ? '上传配置已就绪' : '上传配置未就绪', true);
+          renderJobs(jobs.items || []);
+          if (!quiet) toast('工作台已刷新。');
+        } catch (error) {
+          setStatus('engineStatus', false, '本地引擎不可用');
+          setStatus('insightStatus', false, '等待引擎连接'); setStatus('brandStatus', false, '等待引擎连接'); setStatus('mtgStatus', false, '等待引擎连接');
+          $('jobCount').textContent = '无法连接到 Creative Loop 本地引擎。';
+          $('jobs').innerHTML = '<div class="empty">Creative Loop 目前未启动。请使用 Floatboat 的“打开 Creative Loop 工作台”工作流启动引擎后刷新。</div>';
+          if (!quiet) toast(`无法刷新：${error.message}`, true);
+        }
+      };
+      const switchMode = (mode) => {
+        state.mode = mode; const search = mode === 'search';
+        $('searchTab').classList.toggle('active', search); $('searchTab').setAttribute('aria-selected', String(search));
+        $('urlTab').classList.toggle('active', !search); $('urlTab').setAttribute('aria-selected', String(!search));
+        $('searchFields').classList.toggle('hidden', !search); $('urlFields').classList.toggle('hidden', search);
+      };
+      const submit = async () => {
+        if (state.busy) return;
+        const payload = { idempotency_key: `floatboat-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`, mode: state.mode, wait_for_review: true, auto_upload: false };
+        if (state.mode === 'search') {
+          payload.keyword = $('keyword').value.trim(); payload.search_date_start = $('startDate').value; payload.search_date_end = $('endDate').value; payload.download_count = Number($('downloadCount').value);
+          if (!payload.keyword || !payload.search_date_start || !payload.search_date_end) throw new Error('请填写搜索词和完整日期范围。');
+          if (payload.search_date_start > payload.search_date_end) throw new Error('开始日期不能晚于结束日期。');
+        } else {
+          payload.detail_urls = $('detailUrls').value.split(/[\s,;]+/).map((value) => value.trim()).filter(Boolean);
+          if (!payload.detail_urls.length) throw new Error('请至少粘贴一个 Insight 详情页链接。');
+        }
+        state.busy = true; $('submitButton').disabled = true; $('submitButton').textContent = '正在创建任务…';
+        try { const job = await request('/jobs', { method: 'POST', body: JSON.stringify(payload) }); toast(`任务 ${job.task_id} 已创建，Creative Loop 正在后台处理。`); await refresh(true); }
+        finally { state.busy = false; $('submitButton').disabled = false; $('submitButton').textContent = '开始自动处理'; }
+      };
+      const review = async (taskId, decision) => {
+        const wording = decision === 'approve' ? '通过并上传' : '拒绝上传';
+        if (!window.confirm(`确认${wording}此任务的待审核成片吗？此操作会进入 Creative Loop 的正式审核队列。`)) return;
+        try { await request(`/jobs/${encodeURIComponent(taskId)}/review`, { method: 'POST', body: JSON.stringify({ decision, item_ids: [] }) }); toast(`已接受“${wording}”决定，任务状态将在后台更新。`); await refresh(true); } catch (error) { toast(`无法提交审核：${error.message}`, true); }
+      };
+      const cancel = async (taskId) => {
+        if (!window.confirm('确认取消此任务吗？正在运行的处理会在最近安全点停止，已生成的文件不会被删除。')) return;
+        try { const result = await request(`/jobs/${encodeURIComponent(taskId)}/cancel`, { method: 'POST', body: JSON.stringify({ reason: 'floatboat_workbench_user_cancelled' }) }); toast(result.message || '取消请求已提交。'); await refresh(true); } catch (error) { toast(`无法取消任务：${error.message}`, true); }
+      };
+      $('searchTab').addEventListener('click', () => switchMode('search'));
+      $('urlTab').addEventListener('click', () => switchMode('url'));
+      $('refreshButton').addEventListener('click', () => refresh());
+      $('jobForm').addEventListener('submit', (event) => { event.preventDefault(); submit().catch((error) => toast(error.message, true)); });
+      $('loginButton').addEventListener('click', async () => {
+        const button = $('loginButton'); button.disabled = true; button.textContent = '正在启动登录窗口…';
+        try { const result = await request('/login/open', { method: 'POST', body: '{}' }); if (result.vnc_login_url) window.open(result.vnc_login_url, '_blank', 'noopener'); toast(result.message || 'Insight 登录窗口已启动。'); window.setTimeout(() => refresh(true), 2500); }
+        catch (error) { toast(`无法启动登录窗口：${error.message}`, true); }
+        finally { button.disabled = false; button.textContent = '启动 / 恢复 Insight 登录'; }
+      });
+      $('jobs').addEventListener('click', (event) => { const button = event.target.closest('button[data-action]'); if (!button) return; const { action, job } = button.dataset; if (action === 'approve' || action === 'reject') review(job, action); if (action === 'cancel') cancel(job); });
+      dates(); refresh(true); state.timer = window.setInterval(() => refresh(true), 8000);
+    })();
+  </script>
+</body>
+</html>

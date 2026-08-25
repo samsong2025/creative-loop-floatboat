@@ -1,0 +1,17 @@
+{
+  "app_titles": {
+    "Arrow Move": "Arrow Move",
+    "My Loverse: My story, my drama": "My Loverse My story, my drama",
+    "PineDrama - <font color='red'>Short</font> Dramas": "PineDrama - Short Dramas",
+    "ReelShort - Stream <font color='red'>Drama</font> & TV": "ReelShort - Stream Drama & TV",
+    "ReelShort - Stream Drama & TV": "ReelShort - Stream Drama & TV",
+    "TikTok - Videos, Shop & LIVE": "TikTok - Videos, Shop & LIVE"
+  },
+  "package_names": {
+    "com.myloverse.story.chapter.ai": "My Loverse My story, my drama",
+    "com.newleaf.app.android.victor": "ReelShort - Stream Drama & TV",
+    "com.ss.android.ttmd.video": "PineDrama - Short Dramas",
+    "com.storymatrix.drama": "DramaBox",
+    "com.zhiliaoapp.musically": "TikTok - Videos, Shop & LIVE"
+  }
+}

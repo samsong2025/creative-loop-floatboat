@@ -1,0 +1,26 @@
+{
+  "schema_version": 1,
+  "updated_at": "2026-08-15T06:12:55",
+  "profiles": [
+    {
+      "profile_id": "floatboatfde-e6af4d0a11",
+      "product_name": "floatboat-pde",
+      "brand_name": "floatboat-fde",
+      "assets": {
+        "logo_image_relative_path": null,
+        "icon_image_relative_path": null,
+        "top_banner_image_relative_path": null,
+        "bottom_banner_image_relative_path": null,
+        "end_card_image_relative_path": null,
+        "end_card_video_relative_path": null,
+        "mid_promo_video_relative_path": null
+      },
+      "layout": {
+        "banner_height_ratio": 0.075,
+        "end_card_duration_seconds": 3.0
+      },
+      "created_at": "2026-08-15T06:12:55",
+      "updated_at": "2026-08-15T06:12:55"
+    }
+  ]
+}

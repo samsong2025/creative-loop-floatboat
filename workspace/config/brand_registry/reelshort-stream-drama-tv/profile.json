@@ -1,0 +1,53 @@
+{
+  "brand_id": "reelshort-stream-drama-tv",
+  "product_name": "ReelShort - Stream Drama & TV",
+  "app_title": "ReelShort - Stream Drama & TV",
+  "package_names": [
+    "com.newleaf.app.android.victor"
+  ],
+  "aliases": [
+    "ReelShort - Stream Drama & TV",
+    "ReelShort - Stream <font color='red'>Drama</font> & TV"
+  ],
+  "icon": {
+    "relative_path": "config/brand_registry/reelshort-stream-drama-tv/source/icon.png",
+    "sha256": "c15f364f099d9feaa045791b9b25bd77ada5aeba338519d1df6df6e8ed271c3d",
+    "source_url": "https://adinsights-1258892624.oss-accelerate.aliyuncs.com/pkg_basic_update/logo/8334e0fb598f30bca3049f3c086bde80.png?Expires=1787576346&OSSAccessKeyId=LTAI5tHWzf4ZNhfdSN9byaJb&Signature=0uVheAFCo4FMoXeH4A99q%2BN5rC0%3D&x-oss-process=image%2Fresize%2Cl_96",
+    "source": "insight_app_record",
+    "size_bytes": 3435,
+    "updated_at": "2026-08-24T07:59:10.914813+00:00"
+  },
+  "templates": {
+    "generated_at": "2026-08-24T07:59:10.993778+00:00",
+    "version": 2,
+    "features_relative_path": "config/brand_registry/reelshort-stream-drama-tv/features.json",
+    "assets": {
+      "icon-gray.png": "config/brand_registry/reelshort-stream-drama-tv/templates/icon-gray.png",
+      "icon-edge.png": "config/brand_registry/reelshort-stream-drama-tv/templates/icon-edge.png",
+      "icon-edge-dilated.png": "config/brand_registry/reelshort-stream-drama-tv/templates/icon-edge-dilated.png",
+      "icon-32.png": "config/brand_registry/reelshort-stream-drama-tv/templates/icon-32.png",
+      "icon-48.png": "config/brand_registry/reelshort-stream-drama-tv/templates/icon-48.png",
+      "icon-64.png": "config/brand_registry/reelshort-stream-drama-tv/templates/icon-64.png",
+      "icon-96.png": "config/brand_registry/reelshort-stream-drama-tv/templates/icon-96.png"
+    },
+    "detector_assets": {
+      "grayscale": "config/brand_registry/reelshort-stream-drama-tv/templates/icon-gray.png",
+      "edge": "config/brand_registry/reelshort-stream-drama-tv/templates/icon-edge.png",
+      "edge_dilated": "config/brand_registry/reelshort-stream-drama-tv/templates/icon-edge-dilated.png",
+      "multi_scale_reference_sizes": [
+        32,
+        48,
+        64,
+        96
+      ]
+    }
+  },
+  "detector_strategy": [
+    "icon_grayscale_match",
+    "edge_template_match",
+    "multi_scale_match",
+    "roi_ocr_confirmation"
+  ],
+  "registry_version": 1,
+  "updated_at": "2026-08-24T08:56:41.942622+00:00"
+}

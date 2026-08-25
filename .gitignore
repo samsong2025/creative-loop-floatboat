@@ -1,0 +1,16 @@
+.env
+browser-state/*
+!browser-state/.gitkeep
+logs/*
+!logs/.gitkeep
+workspace/raw/*
+workspace/processed/*
+workspace/review/*
+workspace/output/*
+!workspace/raw/.gitkeep
+!workspace/processed/.gitkeep
+!workspace/review/.gitkeep
+!workspace/output/.gitkeep
+
+workspace/config/mintegral.env
+

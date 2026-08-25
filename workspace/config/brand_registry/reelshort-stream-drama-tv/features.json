@@ -1,0 +1,32 @@
+{
+  "version": 2,
+  "generated_at": "2026-08-24T07:59:10.993778+00:00",
+  "average_hash": "0000011100000011001111010011010000111100001011000000010000000000",
+  "edge_histogram": [
+    8737,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    479
+  ],
+  "assets": {
+    "icon-gray.png": "config/brand_registry/reelshort-stream-drama-tv/templates/icon-gray.png",
+    "icon-edge.png": "config/brand_registry/reelshort-stream-drama-tv/templates/icon-edge.png",
+    "icon-edge-dilated.png": "config/brand_registry/reelshort-stream-drama-tv/templates/icon-edge-dilated.png",
+    "icon-32.png": "config/brand_registry/reelshort-stream-drama-tv/templates/icon-32.png",
+    "icon-48.png": "config/brand_registry/reelshort-stream-drama-tv/templates/icon-48.png",
+    "icon-64.png": "config/brand_registry/reelshort-stream-drama-tv/templates/icon-64.png",
+    "icon-96.png": "config/brand_registry/reelshort-stream-drama-tv/templates/icon-96.png"
+  }
+}

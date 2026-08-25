@@ -1,0 +1,33 @@
+{
+  "schema_version": 1,
+  "updated_at": "2026-08-19T19:00:00+08:00",
+  "sources": {
+    "raw/2026-08-16_0512/ReelShort/English/x_v_259079a89647cd48c07e492b716738a1.mp4": {
+      "review_status": "source_frame_verified",
+      "description": "Persistent source overlay components manually verified from source frames. These are source-specific cover anchors, not a reusable ReelShort profile.",
+      "anchors": [
+        {
+          "id": "top_left_show_logo",
+          "x": 0.02,
+          "y": 0.015,
+          "width": 0.49,
+          "height": 0.095
+        },
+        {
+          "id": "top_right_free_ribbon",
+          "x": 0.76,
+          "y": 0.0,
+          "width": 0.24,
+          "height": 0.15
+        },
+        {
+          "id": "center_translucent_wordmark",
+          "x": 0.50,
+          "y": 0.19,
+          "width": 0.50,
+          "height": 0.09
+        }
+      ]
+    }
+  }
+}

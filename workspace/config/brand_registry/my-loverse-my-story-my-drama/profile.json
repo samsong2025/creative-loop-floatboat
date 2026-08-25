@@ -1,0 +1,53 @@
+{
+  "brand_id": "my-loverse-my-story-my-drama",
+  "product_name": "My Loverse My story, my drama",
+  "app_title": "My Loverse: My story, my drama",
+  "package_names": [
+    "com.myloverse.story.chapter.ai"
+  ],
+  "aliases": [
+    "My Loverse: My story, my drama",
+    "My Loverse My story, my drama"
+  ],
+  "icon": {
+    "relative_path": "config/brand_registry/my-loverse-my-story-my-drama/source/icon.png",
+    "sha256": "cbf0e48bd850553f7e0b0fa32d033434d546cc9535d3f37665a8e7e9102a76ff",
+    "source_url": "https://adinsights-1258892624.oss-accelerate.aliyuncs.com/pkg_basic_update/logo/a185e98842c125da60d93388c05be533.png?Expires=1787327263&OSSAccessKeyId=LTAI5tHWzf4ZNhfdSN9byaJb&Signature=n4YptAOea5dus0g%2BnY%2BjiuCIlVs%3D&x-oss-process=image%2Fresize%2Cl_96",
+    "source": "insight_app_record",
+    "size_bytes": 11268,
+    "updated_at": "2026-08-21T10:47:49.453785+00:00"
+  },
+  "templates": {
+    "generated_at": "2026-08-21T10:47:49.512701+00:00",
+    "version": 2,
+    "features_relative_path": "config/brand_registry/my-loverse-my-story-my-drama/features.json",
+    "assets": {
+      "icon-gray.png": "config/brand_registry/my-loverse-my-story-my-drama/templates/icon-gray.png",
+      "icon-edge.png": "config/brand_registry/my-loverse-my-story-my-drama/templates/icon-edge.png",
+      "icon-edge-dilated.png": "config/brand_registry/my-loverse-my-story-my-drama/templates/icon-edge-dilated.png",
+      "icon-32.png": "config/brand_registry/my-loverse-my-story-my-drama/templates/icon-32.png",
+      "icon-48.png": "config/brand_registry/my-loverse-my-story-my-drama/templates/icon-48.png",
+      "icon-64.png": "config/brand_registry/my-loverse-my-story-my-drama/templates/icon-64.png",
+      "icon-96.png": "config/brand_registry/my-loverse-my-story-my-drama/templates/icon-96.png"
+    },
+    "detector_assets": {
+      "grayscale": "config/brand_registry/my-loverse-my-story-my-drama/templates/icon-gray.png",
+      "edge": "config/brand_registry/my-loverse-my-story-my-drama/templates/icon-edge.png",
+      "edge_dilated": "config/brand_registry/my-loverse-my-story-my-drama/templates/icon-edge-dilated.png",
+      "multi_scale_reference_sizes": [
+        32,
+        48,
+        64,
+        96
+      ]
+    }
+  },
+  "detector_strategy": [
+    "icon_grayscale_match",
+    "edge_template_match",
+    "multi_scale_match",
+    "roi_ocr_confirmation"
+  ],
+  "registry_version": 1,
+  "updated_at": "2026-08-24T08:56:41.848305+00:00"
+}

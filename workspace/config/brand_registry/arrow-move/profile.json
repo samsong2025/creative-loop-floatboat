@@ -1,0 +1,19 @@
+{
+  "brand_id": "arrow-move",
+  "product_name": "Arrow Move",
+  "app_title": "Arrow Move",
+  "package_names": [],
+  "aliases": [
+    "Arrow Move"
+  ],
+  "icon": {},
+  "templates": {},
+  "detector_strategy": [
+    "icon_grayscale_match",
+    "edge_template_match",
+    "multi_scale_match",
+    "roi_ocr_confirmation"
+  ],
+  "registry_version": 1,
+  "updated_at": "2026-08-24T08:56:41.812529+00:00"
+}

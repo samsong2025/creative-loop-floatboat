@@ -1,0 +1,118 @@
+services:
+  creative-loop-api:
+    build:
+      context: ./api
+    container_name: creative-loop-api
+    restart: unless-stopped
+    init: true
+    ipc: host
+    ports:
+      - "127.0.0.1:8000:8000"
+    environment:
+      APP_TIMEZONE: ${APP_TIMEZONE:-Asia/Shanghai}
+      WORKSPACE_DIR: /workspace
+      BROWSER_STATE_DIR: /browser-state
+      LOG_DIR: /logs
+
+      WHISPER_MODEL: ${WHISPER_MODEL:-small}
+      WHISPER_DEVICE: ${WHISPER_DEVICE:-cpu}
+      WHISPER_COMPUTE_TYPE: ${WHISPER_COMPUTE_TYPE:-int8}
+      LANGUAGE_CONFIDENCE_THRESHOLD: ${LANGUAGE_CONFIDENCE_THRESHOLD:-0.80}
+      MIN_SPEECH_SECONDS: ${MIN_SPEECH_SECONDS:-1.5}
+      WHISPER_CACHE_DIR: /model-cache
+      # Semantic audio is valuable when the local model is already available,
+      # but a network model lookup must never hold a production edit for minutes.
+      OPERATOR_SEMANTIC_WHISPER_ENABLED: ${OPERATOR_SEMANTIC_WHISPER_ENABLED:-true}
+      OPERATOR_SEMANTIC_WHISPER_MAX_START_SECONDS: ${OPERATOR_SEMANTIC_WHISPER_MAX_START_SECONDS:-15}
+      OPERATOR_SEMANTIC_SAMPLE_INTERVAL_SECONDS: ${OPERATOR_SEMANTIC_SAMPLE_INTERVAL_SECONDS:-3.0}
+      OPERATOR_SEMANTIC_MAX_SAMPLES: ${OPERATOR_SEMANTIC_MAX_SAMPLES:-60}
+      # Number of videos processed concurrently while acquisition continues.
+      OPERATOR_PROCESS_WORKERS: ${OPERATOR_PROCESS_WORKERS:-2}
+      OPERATOR_ASYNC_PROCESSING: ${OPERATOR_ASYNC_PROCESSING:-1}
+      DYNAMIC_WATERMARK_REQUIRE_PROPAINTER: ${DYNAMIC_WATERMARK_REQUIRE_PROPAINTER:-0}
+
+      # Optional GPU worker based on halfzm/ProPainter-Webui.
+      # Backends: auto, cuda, rocm, directml, cpu, opencv.
+      PROPAINTER_BACKEND: ${PROPAINTER_BACKEND:-auto}
+      PROPAINTER_ROOT: ${PROPAINTER_ROOT:-}
+      PROPAINTER_PYTHON: ${PROPAINTER_PYTHON:-python}
+      PROPAINTER_ALLOW_CPU: ${PROPAINTER_ALLOW_CPU:-1}
+      PROPAINTER_FP16: ${PROPAINTER_FP16:-1}
+      PROPAINTER_MASK_DILATION: ${PROPAINTER_MASK_DILATION:-2}
+      PROPAINTER_SUBVIDEO_LENGTH: ${PROPAINTER_SUBVIDEO_LENGTH:-80}
+      PROPAINTER_TIMEOUT_SECONDS: ${PROPAINTER_TIMEOUT_SECONDS:-3600}
+
+      SELENIUM_REMOTE_URL: http://insight-browser:4444
+      INSIGHT_HOME_URL: https://data.insightrackr.com/
+      INSIGHT_BROWSER_VNC_URL: http://localhost:7900/?autoconnect=1&resize=scale
+
+    volumes:
+      - ./workspace:/workspace
+      - ./browser-state:/browser-state
+      - ./logs:/logs
+      - ./model-cache:/model-cache
+
+    depends_on:
+      insight-browser:
+        condition: service_healthy
+
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3)"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+
+  insight-profile-init:
+    image: alpine:3.22
+    container_name: creative-loop-insight-profile-init
+    user: "0:0"
+    restart: "no"
+    command:
+      - /bin/sh
+      - -lc
+      - |
+        mkdir -p /profile
+        # These symlinks only protect a live Chrome process. This init service
+        # completes before insight-browser starts, so removing stale locks from
+        # a previous container is safe and preserves all actual login data.
+        find /profile -maxdepth 1 -type l -name 'Singleton*' -delete
+        chown -R 1200:1201 /profile
+        chmod 700 /profile
+        echo "Insight profile permissions:"
+        ls -ldn /profile
+    volumes:
+      - insight_browser_profile:/profile
+
+  insight-browser:
+    image: selenium/standalone-chrome:4.47.0-20260808
+    container_name: creative-loop-insight-browser
+    restart: unless-stopped
+    shm_size: "2gb"
+    ports:
+      - "127.0.0.1:4444:4444"
+      - "127.0.0.1:7900:7900"
+    environment:
+      SE_NODE_SESSION_TIMEOUT: "86400"
+      SE_NODE_MAX_SESSIONS: "1"
+      SE_SCREEN_WIDTH: "1440"
+      SE_SCREEN_HEIGHT: "1100"
+      # noVNC is published only on 127.0.0.1 (see ports above), so remove the
+      # extra VNC credential dialog. Insight credentials remain entered only in
+      # the visible remote Chrome and stay in the persistent browser profile.
+      SE_VNC_NO_PASSWORD: "true"
+      TZ: ${APP_TIMEZONE:-Asia/Shanghai}
+    volumes:
+      - insight_browser_profile:/home/seluser/insight-profile
+    depends_on:
+      insight-profile-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:4444/status"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+      start_period: 15s
+
+volumes:
+  insight_browser_profile:

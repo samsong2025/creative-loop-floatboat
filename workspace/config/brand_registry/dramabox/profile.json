@@ -1,0 +1,15 @@
+{
+  "brand_id": "dramabox",
+  "product_name": "DramaBox",
+  "app_title": null,
+  "package_names": [
+    "com.storymatrix.drama"
+  ],
+  "aliases": [
+    "DramaBox"
+  ],
+  "icon": {},
+  "templates": {},
+  "registry_version": 1,
+  "updated_at": "2026-08-18T14:47:03.372211+00:00"
+}

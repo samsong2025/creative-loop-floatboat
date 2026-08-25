@@ -1,0 +1,31 @@
+{
+  "schema_version": 1,
+  "packages": {
+    "com.newleaf.app.android.victor": "reelshort-stream-drama-tv",
+    "com.storymatrix.drama": "dramabox",
+    "com.zhiliaoapp.musically": "tiktok-videos-shop-live",
+    "com.myloverse.story.chapter.ai": "my-loverse-my-story-my-drama",
+    "com.ss.android.ttmd.video": "pinedrama-short-dramas"
+  },
+  "app_titles": {
+    "ReelShort - Stream Drama & TV": "reelshort-stream-drama-tv",
+    "DramaBox": "dramabox",
+    "TikTok - Videos, Shop & LIVE": "tiktok-videos-shop-live",
+    "Arrow Move": "arrow-move",
+    "My Loverse: My story, my drama": "my-loverse-my-story-my-drama",
+    "My Loverse My story, my drama": "my-loverse-my-story-my-drama",
+    "PineDrama": "pinedrama",
+    "PineDrama - Short Dramas": "pinedrama-short-dramas",
+    "PineDrama - <font color='red'>Short</font> Dramas": "pinedrama-short-dramas",
+    "ReelShort - Stream <font color='red'>Drama</font> & TV": "reelshort-stream-drama-tv"
+  },
+  "brands": {
+    "reelshort-stream-drama-tv": "reelshort-stream-drama-tv/profile.json",
+    "dramabox": "dramabox/profile.json",
+    "tiktok-videos-shop-live": "tiktok-videos-shop-live/profile.json",
+    "arrow-move": "arrow-move/profile.json",
+    "my-loverse-my-story-my-drama": "my-loverse-my-story-my-drama/profile.json",
+    "pinedrama": "pinedrama/profile.json",
+    "pinedrama-short-dramas": "pinedrama-short-dramas/profile.json"
+  }
+}

@@ -1,0 +1,32 @@
+{
+  "version": 2,
+  "generated_at": "2026-08-21T10:47:49.512701+00:00",
+  "average_hash": "0000000000011000001111100111011001111110000111000000100000000000",
+  "edge_histogram": [
+    8717,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    499
+  ],
+  "assets": {
+    "icon-gray.png": "config/brand_registry/my-loverse-my-story-my-drama/templates/icon-gray.png",
+    "icon-edge.png": "config/brand_registry/my-loverse-my-story-my-drama/templates/icon-edge.png",
+    "icon-edge-dilated.png": "config/brand_registry/my-loverse-my-story-my-drama/templates/icon-edge-dilated.png",
+    "icon-32.png": "config/brand_registry/my-loverse-my-story-my-drama/templates/icon-32.png",
+    "icon-48.png": "config/brand_registry/my-loverse-my-story-my-drama/templates/icon-48.png",
+    "icon-64.png": "config/brand_registry/my-loverse-my-story-my-drama/templates/icon-64.png",
+    "icon-96.png": "config/brand_registry/my-loverse-my-story-my-drama/templates/icon-96.png"
+  }
+}

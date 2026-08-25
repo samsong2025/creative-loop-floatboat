@@ -1,0 +1,1 @@
+"""Typed domain models for Creative Loop's v2 architecture."""

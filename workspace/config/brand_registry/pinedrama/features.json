@@ -1,0 +1,32 @@
+{
+  "version": 2,
+  "generated_at": "2026-08-24T07:59:29.726870+00:00",
+  "average_hash": "0000000000010000011111100111111001111011111111001110110011111000",
+  "edge_histogram": [
+    8514,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    702
+  ],
+  "assets": {
+    "icon-gray.png": "config/brand_registry/pinedrama/templates/icon-gray.png",
+    "icon-edge.png": "config/brand_registry/pinedrama/templates/icon-edge.png",
+    "icon-edge-dilated.png": "config/brand_registry/pinedrama/templates/icon-edge-dilated.png",
+    "icon-32.png": "config/brand_registry/pinedrama/templates/icon-32.png",
+    "icon-48.png": "config/brand_registry/pinedrama/templates/icon-48.png",
+    "icon-64.png": "config/brand_registry/pinedrama/templates/icon-64.png",
+    "icon-96.png": "config/brand_registry/pinedrama/templates/icon-96.png"
+  }
+}

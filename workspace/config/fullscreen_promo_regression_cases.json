@@ -1,0 +1,26 @@
+{
+  "schema_version": 1,
+  "purpose": "Offline regression cases for generic scene-bounded full-screen mid-promo detection. These cases never start a crawl, render, approval, or upload.",
+  "cases": [
+    {
+      "case_id": "fullscreen_insert_portuguese_confirmed",
+      "kind": "positive",
+      "source_relative_path": "raw/2026-08-16_0512/ReelShort/Portuguese/x_v_06301722f6dafcbc9b23b864110b732e.mp4",
+      "source_sha256": "23a6670d7f8f932358c8a19925e9fd183e21cc04848b44f1e515e6b180da82ab",
+      "semantic_report_relative_path": "output/operator_cache/semantic/23a6670d7f8f932358c8a19925e9fd183e21cc04848b44f1e515e6b180da82ab.v018103-fast1.json",
+      "expected_boundary_source": "user_confirmed_boundary_override",
+      "expected_start_range_seconds": [44.5, 45.8],
+      "expected_end_range_seconds": [66.5, 67.8],
+      "notes": "User-confirmed full-screen trailer/promo begins at 45–46s and returns to story at 67s. The generic detector must resolve the first post-CTA story-return transition, not a merely histogram-similar internal trailer cut at 65s and not the unrelated 78s scene cut. Exact 45–67s remains the separately audited user-confirmed override for this immutable source."
+    },
+    {
+      "case_id": "short_story_no_mid_insert",
+      "kind": "negative",
+      "source_relative_path": "raw/2026-08-17_1004/TikTok - Videos, Shop & LIVE/Portuguese/x_v_1610cac3f7453364379705ce2a5e3cdc.mp4",
+      "source_sha256": "795cf734a26520474b6851a11883b71c9a40f7d7d7357781d49e4a02de0f1baa",
+      "semantic_report_relative_path": "output/operator_cache/semantic/795cf734a26520474b6851a11883b71c9a40f7d7d7357781d49e4a02de0f1baa.v018103-fast1.json",
+      "expected_candidate_count": 0,
+      "notes": "Short story creative without a confirmed mid-stream full-screen insert; protects against false positive deletion."
+    }
+  ]
+}

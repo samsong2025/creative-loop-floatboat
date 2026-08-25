@@ -1,0 +1,94 @@
+{
+  "schema_version": 1,
+  "updated_at": "2026-08-15T04:48:35",
+  "profiles": [
+    {
+      "profile_id": "reelshort-diagonal-tiled-b6453c403cdcedef",
+      "profile_name": "ReelShort diagonal tiled watermark",
+      "brand_name": "ReelShort",
+      "brand_key": "reelshort",
+      "type": "diagonal_tiled",
+      "handler": "diagonal_tiled_grid",
+      "status": "validated_on_source",
+      "created_at": "2026-08-15T04:48:35",
+      "updated_at": "2026-08-15T04:48:35",
+      "source": {
+        "relative_path": "raw/test/x_v_06301722f6dafcbc9b23b864110b732e.mp4",
+        "video": {
+          "fps": 30.0,
+          "frame_count": 3044,
+          "width": 720,
+          "height": 1280,
+          "duration_seconds": 101.467
+        },
+        "report_relative_path": "review/branding_three_anchor_grid/2026-08-15_042457/x_v_06301722f6dafcbc9b23b864110b732e/x_v_06301722f6dafcbc9b23b864110b732e.three-anchor-grid.json"
+      },
+      "geometry": {
+        "origin_normalized": {
+          "x": 0.31319444,
+          "y": 0.78007812
+        },
+        "basis_vectors_normalized": [
+          {
+            "dx": -0.13819444,
+            "dy": -0.21132813,
+            "length_x_norm": 0.40030486,
+            "angle_degrees": -110.1954
+          },
+          {
+            "dx": 0.34305556,
+            "dy": -0.05039063,
+            "length_x_norm": 0.35455931,
+            "angle_degrees": -14.635
+          }
+        ],
+        "canonical_tile_normalized": {
+          "width": 0.27638889,
+          "height": 0.04921875
+        },
+        "corner_angle_degrees": 95.5604
+      },
+      "manual_anchors": [
+        {
+          "label": "A",
+          "normalized_bbox": {
+            "x": 0.01547389,
+            "y": 0.54714912,
+            "width": 0.31914894,
+            "height": 0.04385965
+          }
+        },
+        {
+          "label": "B",
+          "normalized_bbox": {
+            "x": 0.51837524,
+            "y": 0.69846491,
+            "width": 0.27659574,
+            "height": 0.0625
+          }
+        },
+        {
+          "label": "C",
+          "normalized_bbox": {
+            "x": 0.17794971,
+            "y": 0.75548246,
+            "width": 0.27079304,
+            "height": 0.04934211
+          }
+        }
+      ],
+      "template": {
+        "tile_stroke_mask_relative_path": "review/branding_three_anchor_grid/2026-08-15_042457/x_v_06301722f6dafcbc9b23b864110b732e/03_tile_stroke_mask.png",
+        "three_anchor_persistent_template_relative_path": "review/branding_three_anchor_grid/2026-08-15_042457/x_v_06301722f6dafcbc9b23b864110b732e/02_three_anchor_persistent_template.png",
+        "tile_mask_coverage_ratio": 0.454973
+      },
+      "reuse_policy": {
+        "same_source_video": "AUTO",
+        "new_video_same_brand": "REVIEW",
+        "requires_geometry_validation_on_new_video": true,
+        "never_force_on_unknown_layout": true
+      },
+      "notes": "Created by watermark router from validated three-anchor grid."
+    }
+  ]
+}
