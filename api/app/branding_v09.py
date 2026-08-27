@@ -42381,6 +42381,63 @@ def _operator_dynamic_brand_tracks_from_census(
 
 
 
+def _operator_temporal_tracks_from_census(census_report_relative_path):
+    """Convert the strict census once for the temporal frame-mask worker.
+
+    This is deliberately separate from the legacy moving-cover structure:
+    strict census points are pixel boxes whereas ProPainter consumes normalized
+    waypoints.  Keeping the conversion at the handoff prevents the renderer
+    from silently launching a second, inconsistent detector pass.
+    """
+    if not census_report_relative_path:
+        return []
+    try:
+        _, report = _read_json_workspace(
+            census_report_relative_path, "operator_temporal_census_tracks"
+        )
+    except Exception:
+        return []
+    video = report.get("video") or {}
+    try:
+        width, height = int(video.get("width") or 0), int(video.get("height") or 0)
+    except (TypeError, ValueError):
+        return []
+    if width <= 0 or height <= 0:
+        return []
+    converted = []
+    for index, track in enumerate(_operator_dynamic_brand_tracks_from_census(census_report_relative_path), 1):
+        waypoints = []
+        for point in track.get("points") or []:
+            bbox = point.get("bbox") or {}
+            try:
+                x0 = max(0.0, min(1.0, float(bbox.get("x")) / width))
+                y0 = max(0.0, min(1.0, float(bbox.get("y")) / height))
+                x1 = max(x0, min(1.0, (float(bbox.get("x")) + float(bbox.get("width"))) / width))
+                y1 = max(y0, min(1.0, (float(bbox.get("y")) + float(bbox.get("height"))) / height))
+                waypoint = {
+                    "t": round(float(point.get("time_seconds")), 3),
+                    "bbox": [x0, y0, x1, y1],
+                    "confidence": float(point.get("similarity") or point.get("template_score") or 0.0),
+                }
+            except (TypeError, ValueError):
+                continue
+            if x1 > x0 and y1 > y0:
+                waypoints.append(waypoint)
+        waypoints.sort(key=lambda value: value["t"])
+        if len(waypoints) < 2:
+            continue
+        converted.append({
+            "track_id": str(track.get("cluster_id") or f"census-{index:02d}"),
+            "visibility_window": [waypoints[0]["t"], waypoints[-1]["t"]],
+            "max_interpolation_gap_seconds": float(track.get("max_interpolation_gap_seconds") or 0.32),
+            "waypoints": waypoints,
+            "point_count": len(waypoints),
+            "movement_px": track.get("movement_px"),
+            "identity_evidence": track.get("identity_evidence") or "authoritative_census",
+        })
+    return converted
+
+
 def _operator_interpolated_dynamic_bbox(
     track,
     t,
@@ -44048,6 +44105,39 @@ def _resolve_replacement_timeline_overlaps(timeline_events, fps):
     return normalized, resolutions
 
 
+def _operator_fixed_action_vertical_zone(action, width=0, height=0):
+    """Return the compositor lane for a fixed watermark action.
+
+    Older planners sometimes emitted a valid bbox but omitted ``placement``.
+    Those actions were silently excluded from both the top and bottom passes.
+    Geometry is therefore the authoritative fallback; a centre mark is routed
+    to the nearest edge lane so it is treated instead of being left visible.
+    """
+    placement = str((action or {}).get("placement") or "").lower()
+    if placement.startswith("top_") or (action or {}).get("handler") == "top_cleanup_brand_overlay":
+        return "top"
+    if placement.startswith("bottom_"):
+        return "bottom"
+    bbox = (action or {}).get("bbox") or {}
+    if not bbox:
+        segments = (action or {}).get("active_segments") or []
+        if segments:
+            bbox = (segments[0] or {}).get("bbox") or {}
+    try:
+        y = float(bbox.get("y"))
+        box_h = max(1.0, float(bbox.get("height")))
+        if height and height > 0:
+            return "top" if y + box_h / 2.0 < float(height) * 0.50 else "bottom"
+        # Normalized geometry is also accepted in API-created plans.
+        if 0.0 <= y <= 1.0 and 0.0 < box_h <= 1.0:
+            return "top" if y + box_h / 2.0 < 0.50 else "bottom"
+    except (AttributeError, TypeError, ValueError):
+        pass
+    # Preserve the historical top lane for an action with no usable geometry;
+    # this has a renderer and validation path, unlike silently dropping it.
+    return "top"
+
+
 def _replacement_render_sync(
     req: BrandingReplacementRenderRequest
 ):
@@ -44133,13 +44223,7 @@ def _replacement_render_sync(
         if (
             action.get("type")
             == "fixed_brand_overlay"
-            and (
-                action.get("handler")
-                == "top_cleanup_brand_overlay"
-                or str(
-                    action.get("placement") or ""
-                ).startswith("top_")
-            )
+            and _operator_fixed_action_vertical_zone(action, width, height) == "top"
         )
     ]
 
@@ -44156,9 +44240,7 @@ def _replacement_render_sync(
         if (
             action.get("type")
             == "fixed_brand_overlay"
-            and str(
-                action.get("placement") or ""
-            ).startswith("bottom_")
+            and _operator_fixed_action_vertical_zone(action, width, height) == "bottom"
         )
     ]
 
@@ -45124,10 +45206,7 @@ def _top_action_span(
         # bbox but no per-segment OCR receipts. It is still an accepted fixed
         # replacement action, so do not silently skip it for the whole render.
         # Moving layers never reach this helper.
-        if action.get("bbox") and (
-            str(action.get("placement") or "").startswith("top_")
-            or str(action.get("handler") or "") == "top_cleanup_brand_overlay"
-        ):
+        if action.get("bbox") and _operator_fixed_action_vertical_zone(action) == "top":
             return {
                 "start_seconds": 0.0,
                 "end_seconds": round(max(0.0, float(duration or 0.0)), 3),
@@ -49411,10 +49490,7 @@ def _top_action_span_v0123(
         # Legacy fixed-layer plans may carry the accepted geometry without
         # per-segment receipts. Treat such a top fixed action as persistent;
         # otherwise the final compositor emits an untouched source watermark.
-        if action.get("bbox") and (
-            str(action.get("placement") or "").startswith("top_")
-            or str(action.get("handler") or "") == "top_cleanup_brand_overlay"
-        ):
+        if action.get("bbox") and _operator_fixed_action_vertical_zone(action) == "top":
             return {
                 "start_seconds": 0.0,
                 "end_seconds": round(max(0.0, float(duration or 0.0)), 3),
@@ -49733,6 +49809,31 @@ def _replacement_render_sync(
             # source-video failure here.
             preflight_dynamic_tracks = 0
 
+    # Resolve the census path independently of the derived summary count.  A
+    # plan may already contain ``operator_dynamic_brand_expected_track_count``
+    # and therefore skip the old preflight block above; it still must hand the
+    # original strict trajectories to the temporal repair worker.
+    authoritative_census_rel = str(
+        ((plan.get("source") or {}).get("router_report_relative_path") or "")
+    ).strip()
+    try:
+        if authoritative_census_rel:
+            _, authoritative_router = _read_json_workspace(
+                authoritative_census_rel,
+                "replacement_render_authoritative_temporal_tracks",
+            )
+            # API callers may provide either the router report or the census
+            # report directly.  Do not erase the latter while resolving it.
+            if not (authoritative_router.get("verified_dynamic_identity") or {}).get("tracks"):
+                authoritative_census_rel = str(
+                    ((authoritative_router.get("evidence_reports") or {}).get("census") or "")
+                ).strip()
+    except Exception:
+        authoritative_census_rel = ""
+    authoritative_temporal_tracks = _operator_temporal_tracks_from_census(
+        authoritative_census_rel
+    )
+
     if (
         bool(getattr(req, "dynamic_watermark_temporal_recovery_enabled", False))
         and original_source_rel
@@ -49751,19 +49852,93 @@ def _replacement_render_sync(
                 DynamicWatermarkTemporalRepairRequest,
                 dynamic_watermark_temporal_repair_sync,
             )
+        # The production candidate plan predates source-identity persistence
+        # and therefore often contains only the source path.  The preflight
+        # census, however, was already run with the product-bound icon/logo
+        # template.  Resolve that same identity here before invoking temporal
+        # repair; otherwise the repair silently falls back to the generic
+        # ReelShort crop and returns zero tracks / unverifiable residuals.
+        source_identity = dict(
+            (plan.get("source") or {}).get("source_identity")
+            or plan.get("source_identity")
+            or {}
+        )
+        if not source_identity or not source_identity.get("icon_relative_path"):
+            try:
+                source_path_for_identity = _safe_workspace_path(
+                    original_source_rel, must_exist=True
+                )
+                sidecar_path = Path(str(source_path_for_identity) + ".metadata.json")
+                if sidecar_path.is_file():
+                    sidecar = json.loads(sidecar_path.read_text(encoding="utf-8"))
+                    diagnostic = sidecar.get("detail_identity_diagnostic") or {}
+                    brand_id = (
+                        sidecar.get("brand_id")
+                        or diagnostic.get("brand_id")
+                    )
+                    product_name = (
+                        sidecar.get("product_name")
+                        or sidecar.get("app_title")
+                        or diagnostic.get("product_name")
+                        or diagnostic.get("app_title")
+                    )
+                    source_identity = {
+                        **source_identity,
+                        "brand_id": source_identity.get("brand_id") or brand_id,
+                        "product_name": source_identity.get("product_name") or product_name,
+                        "app_title": (
+                            source_identity.get("app_title")
+                            or sidecar.get("app_title")
+                            or diagnostic.get("app_title")
+                            or product_name
+                        ),
+                    }
+                    profile_rel = diagnostic.get("brand_profile")
+                    if profile_rel:
+                        profile_path = _safe_workspace_path(
+                            profile_rel, must_exist=True
+                        )
+                        if profile_path.is_file():
+                            profile = json.loads(profile_path.read_text(encoding="utf-8"))
+                            icon = profile.get("icon") or {}
+                            source_identity.setdefault(
+                                "icon_relative_path", icon.get("relative_path")
+                            )
+                            source_identity.setdefault(
+                                "logo_relative_path", icon.get("relative_path")
+                            )
+                            source_identity["brand_id"] = (
+                                source_identity.get("brand_id")
+                                or profile.get("brand_id")
+                            )
+                            source_identity["product_name"] = (
+                                source_identity.get("product_name")
+                                or profile.get("product_name")
+                            )
+                            source_identity["app_title"] = (
+                                source_identity.get("app_title")
+                                or profile.get("app_title")
+                                or source_identity.get("product_name")
+                            )
+            except Exception:
+                # Identity recovery is an enhancement to the already-created
+                # plan.  Keep the normal generic fallback if a sidecar is
+                # malformed; do not turn a readable source into a hard error.
+                source_identity = source_identity or {}
+
         temporal_handoff = dynamic_watermark_temporal_repair_sync(
             DynamicWatermarkTemporalRepairRequest(
                 relative_path=original_source_rel,
                 competitor_name=str(
-                    ((plan.get("source") or {}).get("source_identity") or {}).get("product_name")
+                    source_identity.get("product_name")
                     or (plan.get("source") or {}).get("competitor_name")
                     or "ReelShort"
                 ),
-                source_brand_id=str(((plan.get("source") or {}).get("source_identity") or {}).get("brand_id") or "") or None,
-                source_product_name=str(((plan.get("source") or {}).get("source_identity") or {}).get("product_name") or "") or None,
-                source_app_title=str(((plan.get("source") or {}).get("source_identity") or {}).get("app_title") or "") or None,
-                source_icon_relative_path=((plan.get("source") or {}).get("source_identity") or {}).get("icon_relative_path"),
-                source_logo_relative_path=((plan.get("source") or {}).get("source_identity") or {}).get("logo_relative_path"),
+                source_brand_id=str(source_identity.get("brand_id") or "") or None,
+                source_product_name=str(source_identity.get("product_name") or "") or None,
+                source_app_title=str(source_identity.get("app_title") or "") or None,
+                source_icon_relative_path=source_identity.get("icon_relative_path"),
+                source_logo_relative_path=source_identity.get("logo_relative_path"),
                 recovery_strength=float(getattr(req, "dynamic_watermark_temporal_recovery_strength", 1.0)),
                 # ProPainter is optional on the CPU/MX250 deployment.  The
                 # local trajectory clean-plate backend remains explicit in
@@ -49771,6 +49946,8 @@ def _replacement_render_sync(
                 # operators can require ProPainter via the environment flag.
                 require_propainter=str(os.getenv("DYNAMIC_WATERMARK_REQUIRE_PROPAINTER", "0")).strip().lower()
                 in {"1", "true", "yes", "on"},
+                verified_tracks=authoritative_temporal_tracks,
+                verified_tracks_source=authoritative_census_rel or None,
                 qa_excluded_intervals=[
                     (float(action.get("start_seconds", 0.0)), float(action.get("end_seconds", 0.0)))
                     for action in (plan.get("actions") or [])
@@ -49800,6 +49977,18 @@ def _replacement_render_sync(
             req.dynamic_brand_cover_auto_from_plan = False
             plan_path = temp_plan_path
             plan_summary = plan.get("summary") or {}
+            # The dynamic pixels have already been repaired in the temporal
+            # intermediate. Keep the original count in a separate audit field
+            # but clear the compositor expectation so business QC does not
+            # demand a second dynamic-cover pass.
+            plan_summary["operator_dynamic_brand_expected_track_count_before_temporal"] = int(
+                plan_summary.get("operator_dynamic_brand_expected_track_count") or 0
+            )
+            plan_summary["operator_dynamic_brand_expected_track_count"] = 0
+            plan["summary"] = plan_summary
+            temp_plan_path.write_text(
+                json.dumps(plan, ensure_ascii=False, indent=2), encoding="utf-8"
+            )
             expected_dynamic_tracks = 0
         else:
             raise HTTPException(
@@ -50921,6 +51110,20 @@ def _production_execution_route(
         action for action in accepted_actions
         if action.get("type") == "fixed_brand_overlay"
     ]
+    plan_video = ((plan.get("source") or {}).get("video") or {})
+    try:
+        plan_width = int(plan_video.get("width") or 0)
+        plan_height = int(plan_video.get("height") or 0)
+    except (TypeError, ValueError):
+        plan_width = plan_height = 0
+    top_fixed_actions = [
+        action for action in fixed_actions
+        if _operator_fixed_action_vertical_zone(action, plan_width, plan_height) == "top"
+    ]
+    bottom_fixed_actions = [
+        action for action in fixed_actions
+        if _operator_fixed_action_vertical_zone(action, plan_width, plan_height) == "bottom"
+    ]
     legacy_moving_actions = [
         action for action in accepted_actions
         if action.get("type") == "moving_brand_overlay"
@@ -50959,6 +51162,8 @@ def _production_execution_route(
             "classification_required": classification_required,
             "fixed_present": fixed_present,
             "fixed_action_count": len(fixed_actions),
+            "top_fixed_action_count": len(top_fixed_actions),
+            "bottom_fixed_action_count": len(bottom_fixed_actions),
             "fixed_strategy": (
                 "source_cleanup_then_own_brand" if fixed_present
                 else "classification_required" if classification_required
@@ -50986,7 +51191,7 @@ def _production_execution_route(
             # No fixed watermark means no fixed-layer compositor work. Dynamic
             # repair is performed before this compositor from strict tracks.
             "watermark_treatment_mode": "rebrand_fixed_clean_dynamic" if fixed_present else "skip_no_fixed_watermark",
-            "compose_top_brand_layers": fixed_present,
+            "compose_top_brand_layers": bool(top_fixed_actions),
             "diagonal_brand_cover_enabled": fixed_present,
             "persistent_watermark_auto_from_source_layout": fixed_present,
             "persistent_watermark_required": fixed_present,
@@ -51049,7 +51254,11 @@ def _operator_diagonal_tiled_watermark_screen(video_entry):
         # at one normalized tile coordinate. Require each tiled candidate to
         # persist across a meaningful portion of the sampled timeline; this is
         # the key separation between a fixed diagonal grid and a moving mark.
-        min_persistence_times = max(8, int(math.ceil(frames_scanned * 0.08)))
+        # A tiled watermark can be faint enough that a few cells are missed in
+        # each sample.  Require persistence plus same-frame lattice evidence,
+        # rather than an arbitrary eight-cell history that made real diagonal
+        # grids pass through on new encoders.
+        min_persistence_times = max(5, int(math.ceil(frames_scanned * 0.06)))
 
         angle_reports = []
         for angle in angles:
@@ -51065,9 +51274,11 @@ def _operator_diagonal_tiled_watermark_screen(video_entry):
             # or a couple of diagonal scene edges from discarding a source.
             # Moving marks can leave many historical positions, but they do
             # not form a dense lattice in the same frame. Keep this gate
-            # conservative: a true tiled source must expose at least eight
-            # persistent tiles and broad coverage before it is discarded.
-            grid = _diag_grid_score(persistent, width, height, 8, 0.45, 0.45)
+            # conservative: a true tiled source must expose several persistent
+            # tiles and broad coverage before it is discarded.  The mandatory
+            # same-frame check below prevents a moving mark's historical path
+            # from satisfying this lower sensitivity threshold.
+            grid = _diag_grid_score(persistent, width, height, 5, 0.35, 0.35)
             # Mobile-video chrome (bottom navigation, right-side social
             # controls and corner icons) is often detected as a pseudo-grid
             # after rotation.  A real tiled watermark should not have most of
@@ -51099,7 +51310,7 @@ def _operator_diagonal_tiled_watermark_screen(video_entry):
             simultaneous_frames = sum(
                 1
                 for frame_hits in per_frame_hits.values()
-                if len(frame_hits) >= 3
+                if len(frame_hits) >= 4
                 and (
                     max(float(h["center_rotated"]["x"]) for h in frame_hits)
                     - min(float(h["center_rotated"]["x"]) for h in frame_hits)
@@ -51114,7 +51325,7 @@ def _operator_diagonal_tiled_watermark_screen(video_entry):
             grid["simultaneous_multi_tile_ratio"] = round(simultaneous_ratio, 4)
             grid["qualifies_as_repeated_grid"] = bool(
                 grid.get("qualifies_as_repeated_grid")
-                and simultaneous_ratio >= 0.40
+                and simultaneous_ratio >= 0.25
             )
             angle_reports.append({"angle_degrees": angle, **grid})
 
@@ -52406,7 +52617,7 @@ def _production_candidate_render_sync(
         )
 
     if (
-        execution_route["watermark"]["fixed_present"]
+        int(execution_route["watermark"].get("top_fixed_action_count") or 0) > 0
         and not validation["summary"]["top_brand_asset_ready"]
     ):
         raise HTTPException(
@@ -75219,6 +75430,44 @@ def _operator_ensure_core_brand_actions(
 
     has_top = bool(top_actions)
 
+    # The original recovery only created a top action.  Router evidence for a
+    # bottom fixed logo was therefore visible to classification/QC but never
+    # handed to the bottom compositor.  Add one bounded bottom action when no
+    # planner action already owns that source mark.
+    bottom_actions = [
+        action for action in actions
+        if action.get("type") == "fixed_brand_overlay"
+        and _operator_fixed_action_vertical_zone(action, width, height) == "bottom"
+    ]
+    if not bottom_actions:
+        bottom_candidates = []
+        for layer in _operator_route_layers_of_type(router, "fixed_strong"):
+            evidence = layer.get("evidence") or {}
+            candidate_bbox = evidence.get("bbox") or {}
+            try:
+                center_y = float(candidate_bbox.get("y")) + float(candidate_bbox.get("height")) / 2.0
+            except (AttributeError, TypeError, ValueError):
+                continue
+            if height > 0 and center_y >= float(height) * 0.62:
+                bottom_candidates.append(layer)
+        if bottom_candidates:
+            layer = max(bottom_candidates, key=lambda value: float(value.get("confidence") or 0.0))
+            bbox = (layer.get("evidence") or {}).get("bbox") or {}
+            action = {
+                "action_id": "operator-forced-bottom-brand",
+                "type": "fixed_brand_overlay",
+                "status": "AUTO",
+                "handler": "bottom_cleanup_brand_overlay",
+                "placement": "bottom_right" if float(bbox.get("x") or 0) >= float(width) * 0.5 else "bottom_left",
+                "bbox": bbox,
+                "active_segments": [{"start_seconds": 0.0, "end_seconds": full_end, "bbox": bbox}],
+                "strategy": "operator_canonical_bottom_brand_full_story",
+                "decision_source": "watermark_router_fixed_strong_bottom",
+                "operator_force_full_story_span": True,
+            }
+            actions.append(action)
+            added.append({"type": "fixed_brand_overlay", "source": action["decision_source"]})
+
     # A terminal app-promo card can be visually distinct enough that OCR sees
     # no readable product text.  If semantic analysis already bounds the final
     # promo segment, it is safer to trim it than retain competitor conversion
@@ -75418,6 +75667,9 @@ def _operator_branding_business_qc(
         action.get("type") == "mid_promo_replace"
         for action in (plan.get("actions") or [])
     )
+    temporal_repair_completed = str(
+        summary.get("dynamic_watermark_temporal_recovery_status") or ""
+    ).lower() == "completed"
     dynamic_expected_track_count = max(
         int(
             plan_summary.get(
@@ -75432,6 +75684,11 @@ def _operator_branding_business_qc(
             or 0
         ),
     )
+    # A completed temporal handoff has already removed the moving source mark
+    # in an intermediate video, so QC must not require a second compositor
+    # receipt for those tracks.
+    if temporal_repair_completed:
+        dynamic_expected_track_count = 0
 
     dynamic_tracks_skipped_by_bottom = list(
         visual.get("dynamic_brand_track_ids_skipped_by_bottom_cover") or []
@@ -76254,7 +76511,6 @@ def _operator_process_video(
             )
         ),
     )
-
     diagonal_screen = run_stage(
         "diagonal_watermark_gate",
         "筛查斜向平铺水印（不符合无痕处理条件的素材将跳过剪辑）",
@@ -76432,6 +76688,18 @@ def _operator_process_video(
         )
     )
 
+    # Persist the acquisition-time competitor identity in every production
+    # plan.  Temporal repair must use the same product-specific template as
+    # the census; relying on a generic fallback makes otherwise valid dynamic
+    # tracks disappear during the render handoff.
+    plan.setdefault("source", {})["source_identity"] = {
+        "brand_id": source_brand_assets.get("brand_id") or source_context.get("brand_id"),
+        "product_name": source_context.get("product_name"),
+        "app_title": source_context.get("app_title") or source_context.get("product_name"),
+        "icon_relative_path": source_brand_assets.get("icon_relative_path"),
+        "logo_relative_path": source_brand_assets.get("logo_relative_path"),
+    }
+
     dynamic_track_preview = (
         _operator_dynamic_brand_tracks_from_census(
             census.get(
@@ -76534,13 +76802,14 @@ def _operator_process_video(
             # the no-match reason; a user boundary override remains available
             # for the exceptional case.  This removes the 4–5 minute legacy
             # OCR/scene pass from the normal production path.
+            legacy_recovery = run_stage(
+                "midpromo_multimodal_recovery",
+                "Mid Promo targeted scene-boundary recovery",
+                lambda: _operator_midpromo_recovery(plan, profile, router),
+            )
             midpromo_recovery = {
                 **midpromo_recovery,
-                "legacy_multimodal_fallback": {
-                    "used": False,
-                    "reason": "skipped_after_fast_recovery_no_boundary_ready_candidate",
-                    "action_added": False,
-                },
+                "legacy_multimodal_fallback": legacy_recovery,
             }
 
     plan.setdefault("summary", {})["mid_promo_replace_count"] = len(
@@ -76575,6 +76844,10 @@ def _operator_process_video(
             dynamic_brand_cover_enabled=False,
             dynamic_brand_cover_census_report_relative_path=None,
             dynamic_brand_cover_auto_from_plan=True,
+            # Verified moving marks are repaired in the temporal stage before
+            # the fixed-layer compositor. Without this flag the compositor is
+            # disabled while business QC still expects dynamic frames.
+            dynamic_watermark_temporal_recovery_enabled=True,
             # Match the verified-track policy: no interpolation across a
             # missing/teleport interval longer than 320ms.
             dynamic_brand_cover_max_gap_seconds=0.32,
@@ -79637,8 +79910,7 @@ def _operator_delete_sync(
         ),
         "media_deleted": False,
         "message": (
-            "Task records were deleted. raw/processed/review/output media were "
-            "not deleted."
+            "任务记录已删除；raw、processed、review、output 媒体文件未删除。"
         ),
     }
 

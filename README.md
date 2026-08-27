@@ -27,6 +27,17 @@ docker compose exec creative-loop-api python -c "from app.propainter_adapter imp
 
 `propainter_cuda_configured` means the CUDA/ProPainter path is configured. `opencv_temporal_mask_configured` means the service is using the CPU/OpenCV fallback; a visible NVIDIA card alone does not change that status.
 
+### NVIDIA / ProPainter container deployment
+
+The normal `compose.yaml` intentionally starts on every machine and does not expose a GPU. On a configured NVIDIA host, copy `.env.example` to `.env`, set `PROPAINTER_HOST_ROOT` to the directory containing `ProPainter/inference_propainter.py` and the model weights, then start the GPU override. This override builds the separate CUDA-enabled API image; the normal image cannot use ProPainter merely because the host has a GPU.
+
+```powershell
+docker compose -f compose.yaml -f compose.gpu.yaml up -d --build
+docker compose -f compose.yaml -f compose.gpu.yaml exec creative-loop-api python -c "from app.propainter_adapter import probe_propainter_backend; print(probe_propainter_backend())"
+```
+
+If the second command does not report `propainter_cuda_configured`, the service will use the explicitly-labelled OpenCV fallback rather than claiming ProPainter has run.
+
 ## 1. Start
 
 PowerShell:

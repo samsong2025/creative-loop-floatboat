@@ -1,0 +1,14 @@
+services:
+  creative-loop-api:
+    # Optional override: use together with compose.yaml only on a host where
+    # Docker can see the GPU (NVIDIA Container Toolkit / Docker Desktop WSL2).
+    gpus: all
+    build:
+      target: gpu
+    environment:
+      PROPAINTER_BACKEND: ${PROPAINTER_BACKEND:-cuda}
+      PROPAINTER_ROOT: /opt/ProPainter-Webui
+      PROPAINTER_PYTHON: ${PROPAINTER_PYTHON:-python}
+    volumes:
+      # Host folder containing ProPainter/ and its installed checkpoints.
+      - ${PROPAINTER_HOST_ROOT:?Set_PROPAINTER_HOST_ROOT_to_your_ProPainter-Webui_folder}:/opt/ProPainter-Webui:ro
