@@ -2,6 +2,15 @@
   "schema_version": 1,
   "updated_at": "2026-08-19T19:00:00+08:00",
   "sources": {
+    "raw/2026-08-28_1503/ReelShort - Stream Drama \u0026 TV/Indonesian/x_v_e9f1da2c89334bbda5d675d00fa8ca0e.mp4": {
+      "review_status": "source_frame_verified",
+      "description": "Persistent ReelShort logo, limited-time offer panel, and centre wordmark verified on source frames.",
+      "anchors": [
+        {"id": "top_left_reelshort_logo", "x": 0.02, "y": 0.015, "width": 0.30, "height": 0.075},
+        {"id": "top_right_limited_offer", "x": 0.68, "y": 0.02, "width": 0.30, "height": 0.115},
+        {"id": "center_reelshort_wordmark", "x": 0.43, "y": 0.22, "width": 0.50, "height": 0.10}
+      ]
+    },
     "raw/2026-08-16_0512/ReelShort/English/x_v_259079a89647cd48c07e492b716738a1.mp4": {
       "review_status": "source_frame_verified",
       "description": "Persistent source overlay components manually verified from source frames. These are source-specific cover anchors, not a reusable ReelShort profile.",

@@ -51404,7 +51404,12 @@ def _production_execution_route(
         if action.get("type") == "end_card_replace"
     ]
 
-    fixed_present = bool(fixed_actions)
+    # Explicit source-layout anchors are authoritative fixed-watermark
+    # evidence even when the router report has no OCR layer (for example a
+    # persistent ReelShort logo/offer panel that the generic census cannot
+    # classify).  Without this, production silently selected the
+    # ``dynamic_only`` route and never ran the fixed compositor.
+    fixed_present = bool(fixed_actions) or bool(plan.get("persistent_watermark_anchor_boxes"))
     dynamic_track_count = max(0, int(verified_dynamic_track_count or 0))
     dynamic_present = dynamic_track_count > 0
     watermark_present = bool(detected_watermark_present) or fixed_present or dynamic_present
@@ -52870,6 +52875,21 @@ def _production_candidate_render_sync(
     actions = plan.get(
         "actions"
     ) or []
+
+    # Load exact-source fixed watermark anchors before building the execution
+    # route.  The generic router may report only strict moving tracks while
+    # persistent corner/centre marks remain visible throughout the story.
+    if not plan.get("persistent_watermark_anchor_boxes"):
+        try:
+            layout_payload = json.loads(
+                (WORKSPACE / "config" / "persistent_watermark_source_layouts.json").read_text(encoding="utf-8")
+            )
+            source_rel = str(((plan.get("source") or {}).get("relative_path") or "")).replace("\\", "/")
+            anchors = ((layout_payload.get("sources") or {}).get(source_rel) or {}).get("anchors") or []
+            if anchors:
+                plan["persistent_watermark_anchor_boxes"] = anchors
+        except Exception:
+            pass
 
     verified_dynamic_track_count = _production_verified_dynamic_track_count(plan)
     detected_watermark_present = _production_detected_watermark_present(plan)
