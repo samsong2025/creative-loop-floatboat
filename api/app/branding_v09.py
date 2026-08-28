@@ -37073,11 +37073,11 @@ def _fallback_semantic_brand_segments(semantic_report, duration_override: float 
         candidate_duration = max(times) - min(times) + 3.0
 
         # OCR sees a persistent "Limited-time offer" banner on many ReelShort
-        # story frames. Treating that repeated banner as a sustained promo
+        # story frames.  Treating that repeated banner as a sustained promo
         # episode produced a 1.5-64.5s replacement covering the entire story.
-        # A fallback candidate must be bounded and visually interstitial: if
-        # narrative subtitles remain present across the evidence, this is an
-        # overlay on story, not a full-screen insert.
+        # A fallback mid-promo candidate must therefore be both bounded and
+        # visually interstitial: if narrative subtitles remain present across
+        # the evidence, this is an overlay on story, not a full-screen insert.
         narrative_activity = [
             float((item.get("text_layer_activity") or {}).get("narrative_subtitle_activity") or 0.0)
             for item in interior
@@ -50186,6 +50186,10 @@ def _replacement_render_sync(
                 in {"1", "true", "yes", "on"},
                 verified_tracks=authoritative_temporal_tracks,
                 verified_tracks_source=authoritative_census_rel or None,
+                # Keep temporal-repair exclusions identical to the downstream
+                # editorial execution route. Unconfirmed REVIEW actions are
+                # skipped by unattended renders and must not skip watermark
+                # cleanup in source pixels that remain in the final video.
                 qa_excluded_intervals=_production_editorial_exclusion_intervals(
                     plan,
                     include_review_actions=bool(getattr(req, "include_review_actions", False)),
@@ -76060,6 +76064,19 @@ def _operator_branding_business_qc(
     temporal_repair_completed = str(
         summary.get("dynamic_watermark_temporal_recovery_status") or ""
     ).lower() == "completed"
+    temporal_repair_qa = {}
+    temporal_report_rel = str(
+        summary.get("dynamic_watermark_temporal_recovery_report_relative_path") or ""
+    ).strip()
+    if temporal_report_rel:
+        try:
+            _, temporal_report = _read_json_workspace(
+                temporal_report_rel,
+                "operator_branding_business_qc_temporal_report",
+            )
+            temporal_repair_qa = temporal_report.get("qa") or {}
+        except Exception:
+            temporal_repair_qa = {}
     dynamic_expected_track_count = max(
         int(
             plan_summary.get(
@@ -76152,6 +76169,18 @@ def _operator_branding_business_qc(
     mid_promo_replace_count = int(summary.get("mid_promo_replace_count") or 0)
 
     failures = []
+
+    # ``completed`` is not sufficient evidence of a real repair: an earlier
+    # implementation marked a CPU transcode complete even though every probe
+    # was pixel-identical to the source.  Require explicit source/output
+    # change evidence whenever temporal repair is the only dynamic treatment.
+    if temporal_repair_completed:
+        if not temporal_repair_qa:
+            failures.append("temporal_repair_report_missing")
+        elif not bool(temporal_repair_qa.get("output_changed_from_source")):
+            failures.append("temporal_repair_produced_no_visual_change")
+        elif int(temporal_repair_qa.get("changed_probe_count") or 0) <= 0:
+            failures.append("temporal_repair_has_no_changed_probes")
 
     if top_expected:
         if top_frames <= 0:

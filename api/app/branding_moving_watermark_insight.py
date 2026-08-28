@@ -2112,6 +2112,13 @@ def dynamic_watermark_temporal_repair_sync(req: DynamicWatermarkTemporalRepairRe
     template = cv2.imread(str(template_path), cv2.IMREAD_GRAYSCALE) if template_path.exists() else None
 
     residual_checks = []
+    # Re-encoding a video can introduce tiny codec noise even when no pixels
+    # were actually treated.  Keep an explicit source-vs-output probe metric
+    # so downstream business QC cannot equate a ``completed`` report with a
+    # visually effective repair.
+    changed_probe_count = 0
+    changed_pixel_ratios = []
+    changed_mae_values = []
     minimum_source_template_correlation = 0.12
     qa_excluded_intervals = [
         (float(start), float(end))
@@ -2142,6 +2149,16 @@ def dynamic_watermark_temporal_repair_sync(req: DynamicWatermarkTemporalRepairRe
             mask = cv2.resize(glyph, (x1 - x0, y1 - y0), interpolation=cv2.INTER_NEAREST) > 0
             src_gray = cv2.cvtColor(source_frame[y0:y1, x0:x1], cv2.COLOR_BGR2GRAY)
             out_gray = cv2.cvtColor(repaired_frame[y0:y1, x0:x1], cv2.COLOR_BGR2GRAY)
+            pixel_delta = cv2.absdiff(src_gray, out_gray)
+            changed_ratio = float(np.mean(pixel_delta >= 8.0)) if pixel_delta.size else 0.0
+            changed_mae = float(np.mean(pixel_delta)) if pixel_delta.size else 0.0
+            changed_pixel_ratios.append(changed_ratio)
+            changed_mae_values.append(changed_mae)
+            # A 1% ROI change at >=8 gray levels is well above ordinary
+            # H.264 quantization drift and is a conservative evidence of an
+            # actual temporal edit.
+            if changed_ratio >= 0.01 and changed_mae >= 1.0:
+                changed_probe_count += 1
             src_edge = cv2.absdiff(src_gray, cv2.GaussianBlur(src_gray, (0, 0), 2.0)).astype(np.float32)
             out_edge = cv2.absdiff(out_gray, cv2.GaussianBlur(out_gray, (0, 0), 2.0)).astype(np.float32)
             baseline = float(np.mean(src_edge[mask])) if np.any(mask) else 0.0
@@ -2250,6 +2267,8 @@ def dynamic_watermark_temporal_repair_sync(req: DynamicWatermarkTemporalRepairRe
                     else None
                 ),
                 "source_signature_evaluable": source_signature_evaluable,
+                "changed_pixel_ratio": round(changed_ratio, 4),
+                "changed_mae": round(changed_mae, 3),
                 "excluded_from_final_delivery": excluded_from_final_delivery,
                 "qa": qa,
             })
@@ -2274,6 +2293,12 @@ def dynamic_watermark_temporal_repair_sync(req: DynamicWatermarkTemporalRepairRe
             for x in residual_checks
         )
     )
+    # Never call a temporal repair complete when all source/output probes are
+    # effectively identical.  This catches the previous failure mode where a
+    # technically valid transcode passed QC while leaving the source video
+    # untouched.
+    if tracks and changed_probe_count <= 0:
+        qa_pass = False
     propainter_required = bool(req.require_propainter and tracks)
     propainter_pass = bool(propainter_result and propainter_result.get("ok"))
     if propainter_required and not propainter_pass:
@@ -2344,6 +2369,10 @@ def dynamic_watermark_temporal_repair_sync(req: DynamicWatermarkTemporalRepairRe
             "source_signature_evaluable_track_count": sum(
                 1 for x in residual_checks if x["source_signature_evaluable"]
             ),
+            "output_changed_from_source": bool(changed_probe_count > 0),
+            "changed_probe_count": int(changed_probe_count),
+            "changed_pixel_ratio_mean": round(float(np.mean(changed_pixel_ratios)), 4) if changed_pixel_ratios else 0.0,
+            "changed_mae_mean": round(float(np.mean(changed_mae_values)), 3) if changed_mae_values else 0.0,
             "qa_excluded_intervals": [
                 {"start_seconds": start, "end_seconds": end}
                 for start, end in qa_excluded_intervals
