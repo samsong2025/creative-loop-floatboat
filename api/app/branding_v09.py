@@ -76006,8 +76006,12 @@ def _operator_branding_business_qc(
     )
     fixed_expected = bool(_operator_route_layers_of_type(router, "fixed_strong"))
     end_card_expected = bool(_operator_route_layers_of_type(router, "end_card"))
+    # Production renders with include_review_actions=False. Keep business QC
+    # aligned with that execution contract so an unconfirmed REVIEW action is
+    # not treated as a required render that the renderer must skip.
     mid_promo_expected = any(
         action.get("type") == "mid_promo_replace"
+        and str(action.get("status") or "").upper() != "REVIEW"
         for action in (plan.get("actions") or [])
     )
     temporal_repair_completed = str(

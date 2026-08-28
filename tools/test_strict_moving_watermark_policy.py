@@ -8,6 +8,7 @@ external service is modified.
 """
 from __future__ import annotations
 
+import json
 import sys
 import tempfile
 import types
@@ -59,6 +60,7 @@ from app.branding_v09 import (
     _operator_dynamic_wordmark_stroke_mask,
     _operator_dynamic_brand_tracks_from_census,
     _operator_interpolated_dynamic_bbox,
+    _operator_branding_business_qc,
     _source_icon_watermark_hit,
     _strict_verified_identity_tracks,
     _strict_verified_visual_tracks,
@@ -824,6 +826,54 @@ def test_low_score_visual_recovery_requires_strong_native_anchors():
     assert any(item["reason"] == "low_score_native_edge_track_lacks_strong_anchors" for item in rejected)
 
 
+def test_business_qc_ignores_unconfirmed_review_midpromo():
+    rendered = {
+        "summary": {"end_card_append_count": 1},
+        "visual_base": {},
+    }
+    plan = {
+        "actions": [
+            {
+                "type": "mid_promo_replace",
+                "status": "REVIEW",
+            }
+        ]
+    }
+
+    result = _operator_branding_business_qc(rendered, {}, {}, plan, {})
+
+    assert result["mid_promo_expected"] is False
+    assert result["mid_promo_replace_count"] == 0
+    assert "mid_promo_expected_but_no_mid_promo_replacement_rendered" not in result["failures"]
+    assert result["ok"] is True
+
+
+def test_default_floatboat_replacement_assets_are_configured():
+    root = Path(__file__).resolve().parents[1]
+    workspace = root / "workspace"
+    registry = json.loads(
+        (workspace / "config" / "brand_replacement_profiles.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    profile = next(
+        item
+        for item in registry["profiles"]
+        if item.get("brand_name") == "floatboat-fde"
+    )
+    assets = profile["assets"]
+
+    for field in (
+        "logo_image_relative_path",
+        "icon_image_relative_path",
+        "end_card_video_relative_path",
+        "mid_promo_video_relative_path",
+    ):
+        relative_path = assets.get(field)
+        assert relative_path, field
+        assert (workspace / relative_path).is_file(), relative_path
+
+
 if __name__ == "__main__":
     test_accepts_dense_moving_verified_identity_track()
     test_rejects_two_point_or_stationary_candidate()
@@ -851,4 +901,6 @@ if __name__ == "__main__":
     test_source_icon_template_creates_a_fixed_lockup_candidate()
     test_reviewed_visual_track_accepts_two_point_brief_motion()
     test_low_score_visual_recovery_requires_strong_native_anchors()
+    test_business_qc_ignores_unconfirmed_review_midpromo()
+    test_default_floatboat_replacement_assets_are_configured()
     print("strict moving-watermark policy regressions passed")
