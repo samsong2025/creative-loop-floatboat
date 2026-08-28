@@ -51,6 +51,7 @@ if "pydantic" not in sys.modules:
 
 from app.branding_v09 import (
     _diag_merge_word_fragments,
+    _diag_signature_similarity,
     _dynamic_visual_template_paths,
     _load_diagonal_brand_cover_geometry,
     _operator_apply_dynamic_brand_cover,
@@ -705,6 +706,14 @@ def test_diagonal_screen_merges_one_large_word_before_counting_tiles():
     assert words[0]["bbox_rotated"]["width"] == 235
 
 
+def test_diagonal_visual_signature_requires_same_content():
+    left = "ffffffffffffffff"
+    same = left
+    different = "0000000000000000"
+    assert _diag_signature_similarity(left, same) == 1.0
+    assert _diag_signature_similarity(left, different) < 0.2
+
+
 def test_empty_legacy_router_placeholder_is_not_a_detected_watermark():
     """Zero-evidence router output must follow the no-watermark route."""
     from app.branding_v09 import _production_router_has_evidence_backed_watermark
@@ -836,6 +845,7 @@ if __name__ == "__main__":
     test_production_route_does_not_execute_unconfirmed_review_actions()
     test_source_context_prefers_material_bound_identity_snapshot()
     test_diagonal_screen_merges_one_large_word_before_counting_tiles()
+    test_diagonal_visual_signature_requires_same_content()
     test_empty_legacy_router_placeholder_is_not_a_detected_watermark()
     test_router_does_not_create_an_unknown_watermark_when_all_evidence_is_empty()
     test_source_icon_template_creates_a_fixed_lockup_candidate()

@@ -7644,7 +7644,61 @@ def _diag_component_hits(
         min_aspect_ratio=float(min_aspect_ratio),
         max_aspect_ratio=float(max_aspect_ratio),
     )
+    inverse_matrix = cv2.invertAffineTransform(matrix)
+    for hit in hits:
+        center = hit.get("center_rotated") or {}
+        source_center = np.dot(
+            inverse_matrix,
+            np.array(
+                [
+                    float(center.get("x") or 0.0),
+                    float(center.get("y") or 0.0),
+                    1.0,
+                ],
+                dtype=np.float32,
+            ),
+        )
+        hit["center_source"] = {
+            "x": round(float(source_center[0]), 2),
+            "y": round(float(source_center[1]), 2),
+        }
+        hit["visual_signature"] = _diag_visual_signature(
+            grouped,
+            hit.get("bbox_rotated") or {},
+        )
     return hits, grouped, matrix
+
+
+def _diag_visual_signature(grouped, bbox):
+    """Return a compact, scale-normalized binary shape signature for a word."""
+    try:
+        x = int(bbox.get("x") or 0)
+        y = int(bbox.get("y") or 0)
+        width = int(bbox.get("width") or 0)
+        height = int(bbox.get("height") or 0)
+        crop = grouped[y:y + height, x:x + width]
+        if crop.size == 0:
+            return None
+        normalized = cv2.resize(crop, (24, 12), interpolation=cv2.INTER_AREA)
+        binary = (normalized >= 80).astype(np.uint8).reshape(-1)
+        return np.packbits(binary).tobytes().hex()
+    except Exception:
+        return None
+
+
+def _diag_signature_similarity(left, right):
+    """Compare normalized watermark silhouettes without keeping image frames."""
+    if not left or not right:
+        return 0.0
+    try:
+        a = bytes.fromhex(str(left))
+        b = bytes.fromhex(str(right))
+    except ValueError:
+        return 0.0
+    if not a or len(a) != len(b):
+        return 0.0
+    differing_bits = sum((byte_a ^ byte_b).bit_count() for byte_a, byte_b in zip(a, b))
+    return 1.0 - differing_bits / float(len(a) * 8)
 
 
 def _diag_merge_word_fragments(
@@ -7835,6 +7889,28 @@ def _diag_persistent_cluster_report(cluster_id, cluster, min_times):
         _median([c[0] for c in centers]),
         _median([c[1] for c in centers]),
     )
+    source_centers = [
+        (
+            float((h.get("center_source") or h.get("center_rotated") or {}).get("x") or 0.0),
+            float((h.get("center_source") or h.get("center_rotated") or {}).get("y") or 0.0),
+        )
+        for h in hits
+    ]
+    median_source_center = (
+        _median([c[0] for c in source_centers]),
+        _median([c[1] for c in source_centers]),
+    )
+    signatures = [h.get("visual_signature") for h in hits if h.get("visual_signature")]
+    # Use the medoid rather than a literal byte majority: anti-aliased text
+    # may differ by a few pixels between sampled frames.
+    visual_signature = None
+    if signatures:
+        visual_signature = max(
+            signatures,
+            key=lambda candidate: _median(
+                [_diag_signature_similarity(candidate, other) for other in signatures]
+            ),
+        )
 
     median_w = int(
         round(_median([float(b["width"]) for b in boxes]))
@@ -7866,6 +7942,11 @@ def _diag_persistent_cluster_report(cluster_id, cluster, min_times):
             "x": round(median_center[0], 2),
             "y": round(median_center[1], 2),
         },
+        "center_source": {
+            "x": round(median_source_center[0], 2),
+            "y": round(median_source_center[1], 2),
+        },
+        "visual_signature": visual_signature,
         "stable_bbox_rotated": stable_bbox,
         "median_area": round(
             _median([float(h["area"]) for h in hits]),
@@ -7990,6 +8071,19 @@ def _diag_grid_score(
         and _gap_repeatability(ys)
     )
 
+    signatures = [t.get("visual_signature") for t in persistent_tiles if t.get("visual_signature")]
+    visual_consistency = False
+    if len(signatures) >= 2:
+        pair_scores = []
+        anchor = signatures[0]
+        for signature in signatures[1:]:
+            pair_scores.append(_diag_signature_similarity(anchor, signature))
+        visual_consistency = bool(
+            pair_scores
+            and _median(pair_scores) >= 0.72
+            and sum(score >= 0.62 for score in pair_scores) >= max(2, int(math.ceil(len(pair_scores) * 0.70)))
+        )
+
     x_span = (
         (max(xs) - min(xs)) / float(max(1, width))
         if len(xs) >= 2 else 0.0
@@ -8020,6 +8114,7 @@ def _diag_grid_score(
         and repeated_shape
         and quadrant_spread
         and lattice_consistency
+        and visual_consistency
     )
 
     return {
@@ -8032,6 +8127,8 @@ def _diag_grid_score(
         "size_consistency": bool(size_consistency),
         "quadrant_spread": bool(quadrant_spread),
         "lattice_consistency": bool(lattice_consistency),
+        "visual_consistency": bool(visual_consistency),
+        "visual_signature_count": len(signatures),
         "grid_score": round(float(score), 4),
     }
 
@@ -51449,6 +51546,20 @@ def _operator_diagonal_tiled_watermark_screen(video_entry):
             if edge_band_ratio >= 0.68:
                 grid["qualifies_as_repeated_grid"] = False
                 grid["rejection_reason"] = "persistent_components_concentrated_in_ui_edge_bands"
+            # UI chrome and subtitles are intentionally excluded from the
+            # discard gate. A genuine tiled source must have repeated marks in
+            # the content-safe middle area, not merely at top/bottom bands.
+            content_tiles = [
+                tile
+                for tile in persistent
+                for center in [tile.get("center_source") or tile.get("median_center_rotated") or {}]
+                if float(height) * 0.12 <= float(center.get("y") or 0.0) <= float(height) * 0.88
+                and float(width) * 0.06 <= float(center.get("x") or 0.0) <= float(width) * 0.94
+            ]
+            grid["content_safe_tile_count"] = len(content_tiles)
+            if len(content_tiles) < 5:
+                grid["qualifies_as_repeated_grid"] = False
+                grid["rejection_reason"] = "insufficient_content_safe_tiles_after_ui_exclusion"
             # A moving watermark can leave many historical positions and
             # falsely resemble a tiled grid. A real tiled watermark presents
             # several repeated marks in the *same frame*. Require that this
@@ -51562,6 +51673,8 @@ def _operator_diagonal_tiled_watermark_screen(video_entry):
                 "size_consistency": bool(best.get("size_consistency")),
                 "quadrant_spread": bool(best.get("quadrant_spread")),
                 "lattice_consistency": bool(best.get("lattice_consistency")),
+                "visual_consistency": bool(best.get("visual_consistency")),
+                "content_safe_tile_count": int(best.get("content_safe_tile_count") or 0),
                 "grid_score": float(best.get("grid_score") or 0.0),
                 "edge_band_tile_ratio": float(best.get("edge_band_tile_ratio") or 0.0),
                 "simultaneous_multi_tile_frames": int(
