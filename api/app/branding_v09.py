@@ -51004,6 +51004,11 @@ class BrandingProductionCandidateRenderRequest(BrandingReplacementRenderRequest)
     # Production mode metadata only; no semantic re-detection.
     production_candidate: bool = True
 
+    # REVIEW actions are diagnostic suggestions and must never be executed by
+    # an unattended production render.  Callers can explicitly opt in only
+    # after a human has confirmed the plan.
+    include_review_actions: bool = False
+
     # Require own End Card asset even if competitor End Card is absent.
     require_own_end_card_asset: bool = True
 
@@ -51241,13 +51246,38 @@ def _operator_diagonal_tiled_watermark_screen(video_entry):
                 sampled_times.append(round(float(t), 3))
                 frames_scanned += 1
                 for angle in angles:
-                    hits, _, _ = _diag_component_hits(
-                        frame, angle, 84.0, 41, 5, 55, 520, 10, 110, 1.8, 18.0, None
+                    # The first pass resists noisy scene texture. The second
+                    # admits faint/compressed tiled marks that otherwise fail
+                    # before their repeated same-frame lattice can be scored.
+                    # Both passes still flow through the strict persistence,
+                    # span and simultaneous-multi-tile gates below, so a
+                    # single moving watermark cannot become a tiled discard.
+                    pass_specs = (
+                        ("strict", 84.0, 41, 5, 55, 520, 10, 110, 1.8, 18.0),
+                        ("sensitive", 76.0, 29, 5, 28, 600, 6, 100, 1.25, 26.0),
                     )
-                    for hit in hits:
-                        hit["time_seconds"] = round(float(t), 3)
-                        hit["angle_degrees"] = angle
-                        angle_hits[angle].append(hit)
+                    seen = set()
+                    for detector_profile, threshold, block, min_side, min_area, max_area, min_width, max_width, aspect_min, aspect_max in pass_specs:
+                        hits, _, _ = _diag_component_hits(
+                            frame, angle, threshold, block, min_side, min_area,
+                            max_area, min_width, max_width, aspect_min, aspect_max,
+                            None,
+                        )
+                        for hit in hits:
+                            center = hit.get("center_rotated") or {}
+                            dedupe_key = (
+                                round(float(center.get("x") or 0.0) / 12.0),
+                                round(float(center.get("y") or 0.0) / 12.0),
+                                round(float(hit.get("width") or 0.0) / 8.0),
+                                round(float(hit.get("height") or 0.0) / 8.0),
+                            )
+                            if dedupe_key in seen:
+                                continue
+                            seen.add(dedupe_key)
+                            hit["time_seconds"] = round(float(t), 3)
+                            hit["angle_degrees"] = angle
+                            hit["detector_profile"] = detector_profile
+                            angle_hits[angle].append(hit)
             t += interval
 
         # A moving watermark leaves historical positions but does not remain
@@ -51354,8 +51384,32 @@ def _operator_diagonal_tiled_watermark_screen(video_entry):
                 if float(left.get("angle_degrees") or 0.0) >= 0.0 >= float(right.get("angle_degrees") or 0.0):
                     if abs(abs(float(left.get("angle_degrees") or 0.0)) - abs(float(right.get("angle_degrees") or 0.0))) <= 5.0:
                         if float(left.get("grid_score") or 0.0) >= 0.90 and float(right.get("grid_score") or 0.0) >= 0.90:
-                            opposite_angle_ambiguity = True
-                            break
+                            # Suppress only the small, edge-heavy ±15° UI
+                            # pattern. A broad persistent lattice is genuine
+                            # evidence even if its edge response appears at
+                            # the mirrored angle as well.
+                            broad_lattice = (
+                                min(
+                                    int(left.get("persistent_tile_count") or 0),
+                                    int(right.get("persistent_tile_count") or 0),
+                                ) >= 6
+                                and min(
+                                    float(left.get("simultaneous_multi_tile_ratio") or 0.0),
+                                    float(right.get("simultaneous_multi_tile_ratio") or 0.0),
+                                ) >= 0.25
+                                and (
+                                    bool(left.get("lattice_consistency"))
+                                    or bool(right.get("lattice_consistency"))
+                                )
+                            )
+                            near_ui_angle = abs(float(left.get("angle_degrees") or 0.0)) <= 15.0
+                            edge_heavy = max(
+                                float(left.get("edge_band_tile_ratio") or 0.0),
+                                float(right.get("edge_band_tile_ratio") or 0.0),
+                            ) >= 0.45
+                            if near_ui_angle and edge_heavy and not broad_lattice:
+                                opposite_angle_ambiguity = True
+                                break
             if opposite_angle_ambiguity:
                 break
         if opposite_angle_ambiguity:
@@ -66859,6 +66913,8 @@ def _operator_source_video_context(
     icon_url = None
     brand_id = None
     brand_profile_relative_path = None
+    brand_identity_source = None
+    brand_identity_snapshot_present = False
 
     if payload:
         sidecar_product = (
@@ -66988,9 +67044,33 @@ def _operator_source_video_context(
         brand_id = _operator_clean_metadata_text(
             _operator_nested_first(payload, ["brand_id"])
         )
-        brand_profile_relative_path = _operator_clean_metadata_text(
-            _operator_nested_first(payload, ["brand_profile"])
-        )
+        # Acquisition writes a material-bound identity snapshot beside every
+        # source video.  Prefer that path so processing is independent of the
+        # machine's global brand registry.  Keep both historical sidecar
+        # locations as compatibility fallbacks for already-downloaded media.
+        snapshot = payload.get("brand_identity_snapshot")
+        if isinstance(snapshot, dict):
+            snapshot_profile = _operator_clean_metadata_text(
+                snapshot.get("profile_relative_path")
+            )
+            if snapshot_profile:
+                brand_profile_relative_path = snapshot_profile
+                brand_identity_source = "material_bound_snapshot"
+                brand_identity_snapshot_present = True
+        if not brand_profile_relative_path:
+            brand_profile_relative_path = _operator_clean_metadata_text(
+                _operator_nested_first(payload, ["brand_profile"])
+            )
+            if brand_profile_relative_path:
+                brand_identity_source = "sidecar_brand_profile"
+        if not brand_profile_relative_path:
+            diagnostic = payload.get("detail_identity_diagnostic")
+            if isinstance(diagnostic, dict):
+                brand_profile_relative_path = _operator_clean_metadata_text(
+                    diagnostic.get("brand_profile")
+                )
+                if brand_profile_relative_path:
+                    brand_identity_source = "detail_identity_diagnostic"
 
     path_product = None
     path_language = None
@@ -67145,6 +67225,8 @@ def _operator_source_video_context(
         "icon_url": icon_url,
         "brand_id": brand_id,
         "brand_profile_relative_path": brand_profile_relative_path,
+        "brand_identity_source": brand_identity_source,
+        "brand_identity_snapshot_present": brand_identity_snapshot_present,
         "metadata_sidecar": (
             sidecar.relative_to(
                 WORKSPACE
@@ -73129,6 +73211,13 @@ def _operator_source_brand_detection_assets(source_context):
         "icon_relative_path": None,
         "logo_relative_path": None,
         "profile_relative_path": profile_rel or None,
+        "identity_source": source_context.get("brand_identity_source") or "unavailable",
+        "template_ready": False,
+        # Text identity remains useful to the OCR detector when a source icon
+        # could not be acquired. Do not turn one missing bitmap into a blind
+        # watermark scan.
+        "product_name": source_context.get("product_name"),
+        "app_title": source_context.get("app_title"),
     }
     if not profile_rel:
         return fallback
@@ -73142,11 +73231,22 @@ def _operator_source_brand_detection_assets(source_context):
 
     icon = profile.get("icon") or {}
     template_assets = (profile.get("templates") or {}).get("assets") or {}
-    icon_rel = str(
-        icon.get("relative_path")
-        or template_assets.get("icon-gray.png")
-        or ""
-    ).strip() or None
+    candidates = [
+        icon.get("relative_path"),
+        template_assets.get("icon-gray.png"),
+        template_assets.get("icon.png"),
+    ]
+    icon_rel = None
+    for candidate in candidates:
+        candidate = str(candidate or "").strip()
+        if not candidate:
+            continue
+        try:
+            if _safe_workspace_path(candidate).is_file():
+                icon_rel = candidate
+                break
+        except Exception:
+            continue
     return {
         "brand_id": str(
             profile.get("brand_id")
@@ -73158,8 +73258,10 @@ def _operator_source_brand_detection_assets(source_context):
         # dedicated wordmark template is registered for the same product.
         "logo_relative_path": icon_rel,
         "profile_relative_path": profile_rel,
-        "product_name": profile.get("product_name"),
-        "app_title": profile.get("app_title"),
+        "identity_source": source_context.get("brand_identity_source") or "profile",
+        "template_ready": bool(icon_rel),
+        "product_name": profile.get("product_name") or source_context.get("product_name"),
+        "app_title": profile.get("app_title") or source_context.get("app_title"),
     }
 
 
@@ -75501,8 +75603,15 @@ def _operator_ensure_core_brand_actions(
                 }
             )
 
+    def _production_approved(action):
+        if str(action.get("status") or "").upper() != "REVIEW":
+            return True
+        candidate = action.get("source_candidate") or {}
+        return bool(candidate.get("user_confirmed") or action.get("user_confirmed"))
+
     has_end = any(
         action.get("type") == "end_card_replace"
+        and _production_approved(action)
         for action in actions
     )
 
@@ -75571,6 +75680,7 @@ def _operator_ensure_core_brand_actions(
 
     has_end = any(
         action.get("type") == "end_card_replace"
+        and _production_approved(action)
         for action in actions
     )
     if not has_end and semantic_end_candidates:
@@ -76831,7 +76941,7 @@ def _operator_process_video(
                     "report_relative_path"
                 ]
             ),
-            include_review_actions=True,
+            include_review_actions=False,
             allow_placeholder_assets=False,
 
             watermark_treatment_mode="rebrand_fixed_clean_dynamic",

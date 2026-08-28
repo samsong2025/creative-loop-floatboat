@@ -607,6 +607,74 @@ def test_production_execution_route_orders_watermark_before_editorial_actions():
     assert unclassified["watermark"]["fixed_strategy"] == "classification_required"
 
 
+def test_production_route_does_not_execute_unconfirmed_review_actions():
+    """Low-confidence semantic suggestions must not cut production footage."""
+    from app.branding_v09 import _production_execution_route
+
+    plan = {
+        "actions": [
+            {"type": "mid_promo_replace", "status": "REVIEW"},
+            {"type": "end_card_replace", "status": "REVIEW"},
+        ]
+    }
+    route = _production_execution_route(plan, include_review_actions=False)
+    assert route["editorial"]["mid_promo_strategy"] == "skip"
+    assert route["editorial"]["end_card_strategy"] == "append_own"
+
+
+def test_source_context_prefers_material_bound_identity_snapshot():
+    """A migrated source must not need config/brand_registry to match itself."""
+    import json
+    import app.branding_v09 as branding
+
+    root = Path(tempfile.mkdtemp())
+    old_workspace = branding.WORKSPACE
+    try:
+        branding.WORKSPACE = root
+        video = root / "raw" / "run" / "ExampleApp" / "English" / "clip.mp4"
+        video.parent.mkdir(parents=True)
+        video.write_bytes(b"fixture")
+        identity = video.parent / "clip.mp4.identity"
+        (identity / "source").mkdir(parents=True)
+        (identity / "source" / "icon.png").write_bytes(b"fixture")
+        profile = identity / "profile.json"
+        profile.write_text(
+            json.dumps(
+                {
+                    "brand_id": "example-app",
+                    "product_name": "ExampleApp",
+                    "icon": {
+                        "relative_path": "raw/run/ExampleApp/English/clip.mp4.identity/source/icon.png"
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        Path(str(video) + ".metadata.json").write_text(
+            json.dumps(
+                {
+                    "product_name": "ExampleApp",
+                    "brand_id": "example-app",
+                    "brand_profile": "config/brand_registry/obsolete/profile.json",
+                    "brand_identity_snapshot": {
+                        "profile_relative_path": "raw/run/ExampleApp/English/clip.mp4.identity/profile.json"
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        context = branding._operator_source_video_context(
+            "raw/run/ExampleApp/English/clip.mp4"
+        )
+        assets = branding._operator_source_brand_detection_assets(context)
+        assert context["brand_identity_source"] == "material_bound_snapshot"
+        assert context["brand_profile_relative_path"].endswith("clip.mp4.identity/profile.json")
+        assert assets["template_ready"] is True
+        assert assets["icon_relative_path"].endswith("clip.mp4.identity/source/icon.png")
+    finally:
+        branding.WORKSPACE = old_workspace
+
+
 def test_empty_legacy_router_placeholder_is_not_a_detected_watermark():
     """Zero-evidence router output must follow the no-watermark route."""
     from app.branding_v09 import _production_router_has_evidence_backed_watermark
@@ -735,6 +803,8 @@ if __name__ == "__main__":
     test_dynamic_clean_repair_rejects_unverified_fade_fallback()
     test_temporal_repair_is_skipped_when_census_has_no_verified_tracks()
     test_production_execution_route_orders_watermark_before_editorial_actions()
+    test_production_route_does_not_execute_unconfirmed_review_actions()
+    test_source_context_prefers_material_bound_identity_snapshot()
     test_empty_legacy_router_placeholder_is_not_a_detected_watermark()
     test_router_does_not_create_an_unknown_watermark_when_all_evidence_is_empty()
     test_source_icon_template_creates_a_fixed_lockup_candidate()

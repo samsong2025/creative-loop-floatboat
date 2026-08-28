@@ -510,6 +510,88 @@ def _write_metadata_sidecar(file_relative_path: str, metadata: dict) -> str:
     return str(sidecar.relative_to(WORKSPACE_DIR))
 
 
+def _materialize_source_identity_snapshot(
+    file_relative_path: str,
+    brand_profile: dict | None,
+) -> dict:
+    """Store the acquired product identity beside its source video.
+
+    A brand registry is useful for deduplicating future acquisitions, but it
+    must not be the only location of a source video's icon/template.  Moving
+    the project or deploying a fresh machine would otherwise turn a valid
+    source identity into an OCR-only watermark scan.  The sidecar references
+    this self-contained snapshot first.
+    """
+    profile = dict(brand_profile or {})
+    media_path = _safe_workspace_path(file_relative_path)
+    if not media_path.is_file() or not profile.get("brand_id"):
+        return {"ok": False, "reason": "media_or_brand_identity_unavailable"}
+
+    snapshot_dir = media_path.parent / (media_path.name + ".identity")
+    source_dir = snapshot_dir / "source"
+    templates_dir = snapshot_dir / "templates"
+    source_dir.mkdir(parents=True, exist_ok=True)
+    templates_dir.mkdir(parents=True, exist_ok=True)
+
+    copied: dict[str, str] = {}
+
+    def copy_asset(relative_path: str | None, destination: Path) -> str | None:
+        if not relative_path:
+            return None
+        try:
+            original = _safe_workspace_path(str(relative_path))
+        except Exception:
+            return None
+        if not original.is_file():
+            return None
+        try:
+            shutil.copy2(original, destination)
+            rel = destination.relative_to(WORKSPACE_DIR).as_posix()
+            copied[str(relative_path)] = rel
+            return rel
+        except OSError:
+            return None
+
+    snapshot = json.loads(json.dumps(profile, ensure_ascii=False))
+    icon = dict(snapshot.get("icon") or {})
+    icon_rel = copy_asset(icon.get("relative_path"), source_dir / "icon.png")
+    if icon_rel:
+        icon["relative_path"] = icon_rel
+    snapshot["icon"] = icon
+
+    templates = dict(snapshot.get("templates") or {})
+    template_assets = dict(templates.get("assets") or {})
+    copied_templates: dict[str, str] = {}
+    for name, relative_path in template_assets.items():
+        safe_name = Path(str(name)).name
+        if not safe_name:
+            continue
+        copied_rel = copy_asset(relative_path, templates_dir / safe_name)
+        if copied_rel:
+            copied_templates[str(name)] = copied_rel
+    if copied_templates:
+        templates["assets"] = {
+            **template_assets,
+            **copied_templates,
+        }
+    snapshot["templates"] = templates
+    snapshot["snapshot"] = {
+        "version": 1,
+        "kind": "material_bound_source_identity",
+        "source_video_relative_path": str(file_relative_path).replace("\\", "/"),
+        "copied_asset_count": len(copied),
+    }
+    snapshot_path = snapshot_dir / "profile.json"
+    snapshot_path.write_text(json.dumps(snapshot, ensure_ascii=False, indent=2), encoding="utf-8")
+    return {
+        "ok": True,
+        "profile_relative_path": snapshot_path.relative_to(WORKSPACE_DIR).as_posix(),
+        "copied_asset_count": len(copied),
+        "icon_relative_path": icon_rel,
+        "brand_id": snapshot.get("brand_id"),
+    }
+
+
 def _get_whisper_model() -> WhisperModel:
     global _MODEL
     with _MODEL_LOCK:
@@ -1817,6 +1899,10 @@ async def crawl_items(payload: CrawlItemsRequest):
                             or duplicate_app_title
                             or duplicate_package
                         ):
+                            identity_snapshot = _materialize_source_identity_snapshot(
+                                existing_path,
+                                brand_identity_profile,
+                            )
                             repaired_metadata = dict(existing_metadata or {})
                             repaired_metadata.update(
                                 {
@@ -1829,6 +1915,13 @@ async def crawl_items(payload: CrawlItemsRequest):
                                         "package_name": duplicate_package,
                                         "icon_url": effective_icon_url,
                                         "brand_id": (brand_identity_profile or {}).get("brand_id"),
+                                        # Always prefer the per-video snapshot.
+                                        # The registry location is kept only as
+                                        # diagnostic provenance and is never a
+                                        # deployment prerequisite for matching.
+                                        "brand_profile": identity_snapshot.get("profile_relative_path"),
+                                        "brand_registry_profile": (identity_summary.get("brand_profile")),
+                                        "brand_identity_snapshot": identity_snapshot,
                                         "product_name": effective_product_name,
                                         "product_name_source": effective_product_source,
                                         "countries": (
@@ -1945,12 +2038,23 @@ async def crawl_items(payload: CrawlItemsRequest):
                         reason,
                     )
 
+                    identity_snapshot = _materialize_source_identity_snapshot(
+                        final_relative_path,
+                        brand_identity_profile,
+                    )
+
                     metadata = {
                         **common_metadata,
                         "sha256": staged["sha256"],
                         "size_bytes": staged["size_bytes"],
                         "routing": "review" if reason else "raw",
                         "review_reason": reason,
+                        # This path is inside the source video's own archive
+                        # directory.  Watermark detection must use it before
+                        # consulting any global registry cache.
+                        "brand_profile": identity_snapshot.get("profile_relative_path"),
+                        "brand_registry_profile": identity_summary.get("brand_profile"),
+                        "brand_identity_snapshot": identity_snapshot,
                         "saved_at": datetime.now(
                             ZoneInfo(APP_TIMEZONE)
                         ).isoformat(timespec="seconds"),
