@@ -50,6 +50,7 @@ if "pydantic" not in sys.modules:
     sys.modules["pydantic"] = pydantic_stub
 
 from app.branding_v09 import (
+    _diag_merge_word_fragments,
     _dynamic_visual_template_paths,
     _load_diagonal_brand_cover_geometry,
     _operator_apply_dynamic_brand_cover,
@@ -675,6 +676,35 @@ def test_source_context_prefers_material_bound_identity_snapshot():
         branding.WORKSPACE = old_workspace
 
 
+def test_diagonal_screen_merges_one_large_word_before_counting_tiles():
+    """Letters of a moving word are one mark, never four tiled marks."""
+    fragments = []
+    for index in range(6):
+        x = 100 + index * 42
+        fragments.append(
+            {
+                "bbox_rotated": {"x": x, "y": 320, "width": 25, "height": 44},
+                "center_rotated": {"x": x + 12.5, "y": 342.0},
+                "area": 25 * 44,
+                "aspect_ratio": 25 / 44,
+                "fill_ratio": 0.25,
+                "pixel_count": int(25 * 44 * 0.25),
+            }
+        )
+    words = _diag_merge_word_fragments(
+        fragments,
+        min_component_width=28,
+        max_component_width=600,
+        min_component_height=10,
+        max_component_height=110,
+        min_aspect_ratio=1.25,
+        max_aspect_ratio=26.0,
+    )
+    assert len(words) == 1
+    assert words[0]["word_fragment_count"] == 6
+    assert words[0]["bbox_rotated"]["width"] == 235
+
+
 def test_empty_legacy_router_placeholder_is_not_a_detected_watermark():
     """Zero-evidence router output must follow the no-watermark route."""
     from app.branding_v09 import _production_router_has_evidence_backed_watermark
@@ -805,6 +835,7 @@ if __name__ == "__main__":
     test_production_execution_route_orders_watermark_before_editorial_actions()
     test_production_route_does_not_execute_unconfirmed_review_actions()
     test_source_context_prefers_material_bound_identity_snapshot()
+    test_diagonal_screen_merges_one_large_word_before_counting_tiles()
     test_empty_legacy_router_placeholder_is_not_a_detected_watermark()
     test_router_does_not_create_an_unknown_watermark_when_all_evidence_is_empty()
     test_source_icon_template_creates_a_fixed_lockup_candidate()

@@ -1027,7 +1027,10 @@ def _word_window_candidates(words: list[dict[str, Any]], target: str) -> list[di
 
 
 def _report_candidate_times(report: dict[str, Any], threshold: float) -> list[dict[str, Any]]:
-    hits = []
+    # Keep glyph-like components long enough to merge them on their deskewed
+    # baseline. Counting letters independently can turn one moving word into
+    # a false diagonal tiled grid.
+    fragments = []
 
     for det in report.get("detections") or []:
         try:
@@ -7597,13 +7600,15 @@ def _diag_component_hits(
         h = int(stats[label, cv2.CC_STAT_HEIGHT])
         pixels = int(stats[label, cv2.CC_STAT_AREA])
 
-        if w < int(min_component_width) or w > int(max_component_width):
+        if w < max(3, min(8, int(min_component_width))) or w > int(max_component_width):
             continue
-        if h < int(min_component_height) or h > int(max_component_height):
+        if h < max(3, min(6, int(min_component_height))) or h > int(max_component_height):
             continue
 
         aspect = w / float(max(1, h))
-        if aspect < float(min_aspect_ratio) or aspect > float(max_aspect_ratio):
+        # The complete word, not an individual glyph, must meet the final
+        # word-shape criterion.
+        if aspect < 0.15 or aspect > float(max_aspect_ratio):
             continue
 
         fill = pixels / float(max(1, w * h))
@@ -7611,7 +7616,7 @@ def _diag_component_hits(
         if fill < 0.03 or fill > 0.80:
             continue
 
-        hits.append(
+        fragments.append(
             {
                 "bbox_rotated": {
                     "x": x,
@@ -7626,10 +7631,125 @@ def _diag_component_hits(
                 "area": int(w * h),
                 "aspect_ratio": round(aspect, 4),
                 "fill_ratio": round(fill, 6),
+                "pixel_count": pixels,
             }
         )
 
+    hits = _diag_merge_word_fragments(
+        fragments,
+        min_component_width=int(min_component_width),
+        max_component_width=int(max_component_width),
+        min_component_height=int(min_component_height),
+        max_component_height=int(max_component_height),
+        min_aspect_ratio=float(min_aspect_ratio),
+        max_aspect_ratio=float(max_aspect_ratio),
+    )
     return hits, grouped, matrix
+
+
+def _diag_merge_word_fragments(
+    fragments,
+    *,
+    min_component_width,
+    max_component_width,
+    min_component_height,
+    max_component_height,
+    min_aspect_ratio,
+    max_aspect_ratio,
+):
+    """Merge glyph fragments into one deskewed word candidate.
+
+    An outlined or semi-transparent moving word can be split into its letters
+    by connected components.  Joining only baseline-aligned nearby fragments
+    before tile counting prevents those letters from masquerading as repeated
+    watermarks, while the height-relative gap preserves separately tiled
+    words.
+    """
+    fragments = list(fragments or [])
+    if not fragments:
+        return []
+
+    parent = list(range(len(fragments)))
+
+    def find(index):
+        while parent[index] != index:
+            parent[index] = parent[parent[index]]
+            index = parent[index]
+        return index
+
+    def union(left, right):
+        left_root = find(left)
+        right_root = find(right)
+        if left_root != right_root:
+            parent[right_root] = left_root
+
+    for left, left_fragment in enumerate(fragments):
+        a = left_fragment["bbox_rotated"]
+        a_bottom = float(a["y"] + a["height"])
+        a_center_y = float(a["y"]) + float(a["height"]) / 2.0
+        for right in range(left + 1, len(fragments)):
+            b = fragments[right]["bbox_rotated"]
+            b_bottom = float(b["y"] + b["height"])
+            b_center_y = float(b["y"]) + float(b["height"]) / 2.0
+            vertical_overlap = max(
+                0.0,
+                min(a_bottom, b_bottom) - max(float(a["y"]), float(b["y"])),
+            )
+            baseline_aligned = (
+                vertical_overlap >= 0.55 * min(float(a["height"]), float(b["height"]))
+                or abs(a_center_y - b_center_y) <= 0.40 * max(float(a["height"]), float(b["height"]))
+            )
+            if not baseline_aligned:
+                continue
+            horizontal_gap = max(
+                float(a["x"]) - float(b["x"] + b["width"]),
+                float(b["x"]) - float(a["x"] + a["width"]),
+                0.0,
+            )
+            max_word_gap = max(
+                12.0,
+                min(120.0, 1.80 * max(float(a["height"]), float(b["height"]))),
+            )
+            if horizontal_gap <= max_word_gap:
+                union(left, right)
+
+    groups = {}
+    for index, fragment in enumerate(fragments):
+        groups.setdefault(find(index), []).append(fragment)
+
+    hits = []
+    for group in groups.values():
+        x1 = min(int(item["bbox_rotated"]["x"]) for item in group)
+        y1 = min(int(item["bbox_rotated"]["y"]) for item in group)
+        x2 = max(int(item["bbox_rotated"]["x"] + item["bbox_rotated"]["width"]) for item in group)
+        y2 = max(int(item["bbox_rotated"]["y"] + item["bbox_rotated"]["height"]) for item in group)
+        width = x2 - x1
+        height = y2 - y1
+        if (
+            width < int(min_component_width)
+            or width > int(max_component_width)
+            or height < int(min_component_height)
+            or height > int(max_component_height)
+        ):
+            continue
+        aspect = width / float(max(1, height))
+        if aspect < float(min_aspect_ratio) or aspect > float(max_aspect_ratio):
+            continue
+        pixel_count = sum(int(item.get("pixel_count") or 0) for item in group)
+        fill = pixel_count / float(max(1, width * height))
+        if fill < 0.03 or fill > 0.80:
+            continue
+        hits.append(
+            {
+                "bbox_rotated": {"x": x1, "y": y1, "width": width, "height": height},
+                "center_rotated": {"x": round(x1 + width / 2.0, 2), "y": round(y1 + height / 2.0, 2)},
+                "area": int(width * height),
+                "aspect_ratio": round(aspect, 4),
+                "fill_ratio": round(fill, 6),
+                "word_fragment_count": len(group),
+            }
+        )
+    return hits
 
 
 def _cluster_diag_hits(hits, center_tolerance, area_ratio_tolerance):
