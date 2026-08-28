@@ -74735,7 +74735,9 @@ def _operator_semantic_cache_identity(
         "whisper_enabled": _operator_semantic_whisper_enabled(),
         "whisper_translation_enabled": whisper_translation_enabled,
         "whisper_model": str(
-            os.getenv("OPERATOR_SEMANTIC_WHISPER_MODEL") or "base"
+            os.getenv("OPERATOR_SEMANTIC_WHISPER_MODEL")
+            or os.getenv("WHISPER_MODEL")
+            or "small"
         ).strip(),
     }
     return hashlib.sha256(
@@ -77004,11 +77006,15 @@ def _operator_process_video(
                     ),
                     whisper_device="cpu",
                     whisper_compute_type="int8",
-                    # Keep semantic classification independent from the larger
-                    # acquisition language model. A base model is sufficient
-                    # for promo/CTA phrase scoring and avoids a second small
-                    # model pass turning a 90s clip into a long CPU job.
-                    whisper_model=os.getenv("OPERATOR_SEMANTIC_WHISPER_MODEL") or "base",
+                    # Reuse the configured acquisition model by default. The
+                    # container ships the `small` snapshot; hard-coding `base`
+                    # made semantic Whisper fail offline even though a valid
+                    # local model was available.
+                    whisper_model=(
+                        os.getenv("OPERATOR_SEMANTIC_WHISPER_MODEL")
+                        or os.getenv("WHISPER_MODEL")
+                        or "small"
+                    ),
                 )
             ),
         )
