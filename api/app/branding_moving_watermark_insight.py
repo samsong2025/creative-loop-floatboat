@@ -2196,11 +2196,30 @@ def dynamic_watermark_temporal_repair_sync(req: DynamicWatermarkTemporalRepairRe
             if excluded_from_final_delivery:
                 qa = "not_applicable_editorial_replacement"
             elif not source_signature_evaluable:
+                # Product-bound icon/logo templates are authoritative identity
+                # evidence, but their high-pass correlation can be unevaluable
+                # on textured shots. In that case use both a relative edge
+                # guard and an absolute residual-energy guard: a low-baseline
+                # ROI may have a ratio above 1.5 while still being visually
+                # clean (the previous 1.9797 false rejection was 0.985 absolute
+                # edge energy). Never accept a high absolute residual merely
+                # because the ratio denominator is small.
+                absolute_residual_limit = max(
+                    1.25,
+                    float(req.max_residual_edge_ratio) * 4.0,
+                )
+                relative_residual_limit = max(
+                    1.50,
+                    float(req.max_residual_edge_ratio) * 2.5,
+                )
                 qa = (
                     "pass_source_specific_identity_only"
                     if source_specific_track
                     and track_template_score >= 0.20
-                    and edge_ratio <= max(1.50, float(req.max_residual_edge_ratio) * 2.5)
+                    and (
+                        edge_ratio <= relative_residual_limit
+                        or residual <= absolute_residual_limit
+                    )
                     else "review_no_source_template_signal"
                 )
             elif residual_template_ratio <= float(req.max_residual_edge_ratio):
