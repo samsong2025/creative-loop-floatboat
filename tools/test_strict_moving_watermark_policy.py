@@ -61,6 +61,7 @@ from app.branding_v09 import (
     _operator_dynamic_brand_tracks_from_census,
     _operator_interpolated_dynamic_bbox,
     _operator_branding_business_qc,
+    _production_editorial_exclusion_intervals,
     _fallback_semantic_brand_segments,
     _source_icon_watermark_hit,
     _strict_verified_identity_tracks,
@@ -849,6 +850,17 @@ def test_business_qc_ignores_unconfirmed_review_midpromo():
     assert result["ok"] is True
 
 
+def test_dynamic_repair_excludes_only_executed_editorial_actions():
+    plan = {
+        "actions": [
+            {"type": "mid_promo_replace", "status": "REVIEW", "start_seconds": 10, "end_seconds": 20},
+            {"type": "end_card_replace", "status": "AUTO", "start_seconds": 90, "end_seconds": 98},
+        ]
+    }
+    assert _production_editorial_exclusion_intervals(plan, include_review_actions=False) == [(90.0, 98.0)]
+    assert _production_editorial_exclusion_intervals(plan, include_review_actions=True) == [(10.0, 20.0), (90.0, 98.0)]
+
+
 def test_fallback_midpromo_rejects_persistent_banner_over_story():
     # A static "Limited-time offer" banner is present in OCR on every sample,
     # while narrative subtitles remain visible. This must not become a
@@ -939,6 +951,7 @@ if __name__ == "__main__":
     test_reviewed_visual_track_accepts_two_point_brief_motion()
     test_low_score_visual_recovery_requires_strong_native_anchors()
     test_business_qc_ignores_unconfirmed_review_midpromo()
+    test_dynamic_repair_excludes_only_executed_editorial_actions()
     test_fallback_midpromo_rejects_persistent_banner_over_story()
     test_fallback_midpromo_keeps_bounded_fullscreen_candidate()
     test_default_floatboat_replacement_assets_are_configured()

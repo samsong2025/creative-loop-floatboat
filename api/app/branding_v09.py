@@ -50186,12 +50186,10 @@ def _replacement_render_sync(
                 in {"1", "true", "yes", "on"},
                 verified_tracks=authoritative_temporal_tracks,
                 verified_tracks_source=authoritative_census_rel or None,
-                qa_excluded_intervals=[
-                    (float(action.get("start_seconds", 0.0)), float(action.get("end_seconds", 0.0)))
-                    for action in (plan.get("actions") or [])
-                    if action.get("type") in {"mid_promo_replace", "end_card_replace"}
-                    and float(action.get("end_seconds", 0.0)) >= float(action.get("start_seconds", 0.0))
-                ],
+                qa_excluded_intervals=_production_editorial_exclusion_intervals(
+                    plan,
+                    include_review_actions=bool(getattr(req, "include_review_actions", False)),
+                ),
                 output_dir_relative_path=getattr(req, "dynamic_watermark_temporal_recovery_output_dir_relative_path", None),
             )
         )
@@ -51335,6 +51333,28 @@ def _production_detected_watermark_present(plan: dict[str, Any]) -> bool:
         # Lack of a router report is not evidence of a watermark. The normal
         # planner actions and strict dynamic census remain available below.
         return False
+
+
+def _production_editorial_exclusion_intervals(
+    plan: dict[str, Any],
+    include_review_actions: bool = False,
+) -> list[tuple[float, float]]:
+    """Return only editorial intervals that will actually be rendered."""
+    intervals = []
+    for action in (plan or {}).get("actions") or []:
+        if action.get("type") not in {"mid_promo_replace", "end_card_replace"}:
+            continue
+        status = str(action.get("status") or "").strip().upper()
+        if status == "REVIEW" and not bool(include_review_actions):
+            continue
+        try:
+            start = float(action.get("start_seconds", 0.0))
+            end = float(action.get("end_seconds", 0.0))
+        except (TypeError, ValueError):
+            continue
+        if 0.0 <= start < end:
+            intervals.append((start, end))
+    return intervals
 
 
 def _production_execution_route(
