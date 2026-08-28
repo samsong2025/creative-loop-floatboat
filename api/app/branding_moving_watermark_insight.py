@@ -866,6 +866,15 @@ def _render_detection_box_preview(
             writer.stdin.close()
         except Exception:
             pass
+    # The fade preview encoder writes video-only output; audio muxing is
+    # optional on this diagnostic path but the report must always expose a
+    # defined value.
+    audio_muxed = False
+    audio_mux_error = None
+    # This preview emits a video-only diagnostic. Keep audio fields explicit
+    # even when no mux step is requested.
+    audio_muxed = False
+    audio_mux_error = None
     return_code = writer.wait(timeout=180)
     # The raw x264 writer intentionally receives video frames only.  If we
     # hand that intermediate directly to the compositor, FFmpeg sees no source
@@ -1325,8 +1334,18 @@ def dynamic_watermark_box_preview_sync(req: DynamicWatermarkBoxPreviewRequest) -
         source_brand_id=req.source_brand_id,
         source_product_name=req.source_product_name,
         source_app_title=req.source_app_title,
-        source_icon_relative_path=req.source_icon_relative_path,
-        source_logo_relative_path=req.source_logo_relative_path,
+        # Acquisition sidecars often contain a square app icon, which is not
+        # the moving in-video ReelShort wordmark.  For ReelShort use the
+        # calibrated wordmark reference instead of matching the icon across
+        # arbitrary story content.
+        source_icon_relative_path=(
+            None if "reelshort" in str(req.competitor_name or "").lower()
+            else req.source_icon_relative_path
+        ),
+        source_logo_relative_path=(
+            None if "reelshort" in str(req.competitor_name or "").lower()
+            else req.source_logo_relative_path
+        ),
         dynamic_visual_mode=True,
         dynamic_visual_sample_interval_seconds=float(req.sample_interval_seconds),
         dynamic_visual_min_persistence_ratio=float(req.min_persistence_ratio),
@@ -1782,6 +1801,8 @@ def dynamic_watermark_fade_preview_sync(req: DynamicWatermarkFadePreviewRequest)
             writer.stdin.close()
         except Exception:
             pass
+    audio_muxed = False
+    audio_mux_error = None
     return_code = writer.wait(timeout=180)
     report = {
         "ok": return_code == 0 and frames_written > 0,
@@ -1898,6 +1919,16 @@ def _authoritative_temporal_tracks(raw_tracks: list[dict[str, Any]]) -> list[dic
             })
         waypoints.sort(key=lambda point: point["t"])
         if len(waypoints) < 2:
+            continue
+        # The strict census contract requires the reviewed-template confidence
+        # threshold. Older reports could contain broad visual matches with
+        # scores around 0.3-0.45 (faces, subtitles, clothing), which caused
+        # temporal repair to repaint unrelated story regions. Reject those
+        # tracks instead of treating them as dynamic watermarks.
+        mean_confidence = float(np.mean([
+            float(point.get("confidence") or 0.0) for point in waypoints
+        ]))
+        if mean_confidence < 0.62:
             continue
         window = track.get("visibility_window") or [waypoints[0]["t"], waypoints[-1]["t"]]
         try:

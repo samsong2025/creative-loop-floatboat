@@ -1909,6 +1909,7 @@ def _fit_to_width(frame, target_width: int):
 
 def _label_pane(frame, label: str):
     out = frame.copy()
+    frame_height, frame_width = out.shape[:2]
     cv2.rectangle(out, (0, 0), (min(out.shape[1], 175), 34), (0, 0, 0), thickness=-1)
     cv2.putText(
         out,
@@ -2283,7 +2284,7 @@ def _dynamic_visual_reference_template_paths():
 
 
 def _dynamic_visual_template_paths(req):
-    """Return material-bound icon/logo templates before generic fallbacks."""
+    """Return a bank of icon, logo and brand-name templates for dynamic marks."""
     paths = []
     for value in (
         getattr(req, "source_icon_relative_path", None),
@@ -2297,6 +2298,28 @@ def _dynamic_visual_template_paths(req):
             continue
         if candidate.is_file() and candidate not in paths:
             paths.append(candidate)
+    # Generate a lightweight text template when a product/brand name is
+    # available.  Dynamic watermarks are often rendered as text rather than
+    # the square acquisition icon; keeping this candidate in the same bank
+    # lets temporal scoring select whichever form is actually present.
+    text_value = str(
+        getattr(req, "source_product_name", None)
+        or getattr(req, "source_app_title", None)
+        or ""
+    ).strip()
+    if text_value:
+        try:
+            import hashlib
+            safe = hashlib.sha1(text_value.encode("utf-8")).hexdigest()[:12]
+            text_path = WORKSPACE / "config" / f"dynamic_text_template_{safe}.png"
+            if not text_path.is_file():
+                canvas = np.zeros((96, 420), dtype=np.uint8)
+                cv2.putText(canvas, text_value[:28], (6, 66), cv2.FONT_HERSHEY_SIMPLEX, 1.45, 255, 3, cv2.LINE_AA)
+                cv2.imwrite(str(text_path), canvas)
+            if text_path.is_file() and text_path not in paths:
+                paths.append(text_path)
+        except Exception:
+            pass
     # Keep generic templates in the compatibility list for diagnostics and old
     # callers. Production scan selection below is product-identity first and
     # will not use these templates when a source-specific asset is available.
@@ -45835,6 +45858,8 @@ def _load_diagonal_brand_cover_geometry(
                 float(getattr(req, "persistent_watermark_cover_expand_ratio", 1.12)),
             )
             for raw in explicit_anchors:
+                if str(raw.get("kind") or "fixed_watermark").lower() != "fixed_watermark":
+                    continue
                 try:
                     x = float(raw["x"])
                     y = float(raw["y"])
@@ -45854,6 +45879,7 @@ def _load_diagonal_brand_cover_geometry(
                 points.append(
                     {
                         "id": str(raw.get("id") or f"anchor-{len(points) + 1:02d}"),
+                        "treatment": str(raw.get("treatment") or "inpaint"),
                         "center": {
                             "x": int(round((x + box_w / 2.0) * width)),
                             "y": int(round((y + box_h / 2.0) * height)),
@@ -46450,6 +46476,7 @@ def _apply_diagonal_brand_cover(
         return frame
 
     out = frame.copy()
+    frame_height, frame_width = out.shape[:2]
 
     for point in (
         geometry.get(
@@ -46482,20 +46509,33 @@ def _apply_diagonal_brand_cover(
             "width": point_width,
             "height": point_height,
         }
-        # Persistent anchors are fixed competitor product UI. Replace them
-        # deterministically with the own brand; only moving tracks use repair.
-        assets = profile.get("assets") or {}
-        logo = _load_bgr_asset(
-            assets.get("logo_image_relative_path")
-            or assets.get("icon_image_relative_path")
-        )
-        out = _draw_brand_banner(
-            out,
-            point_bbox,
-            profile.get("product_name") or profile.get("brand_name") or "",
-            logo_image=logo,
-            min_height=point_height,
-        )
+        # Source-specific anchors are not all brand marks.  The countdown /
+        # offer panel and the large translucent centre wordmark must be
+        # removed, not replaced with a generic opaque banner.  Inpaint each
+        # region from neighbouring scene pixels to avoid the previous giant
+        # gray/black rectangle artifact.  A logo replacement can be enabled
+        # explicitly per anchor via ``treatment=own_brand``.
+        treatment = str(point.get("treatment") or "inpaint").lower()
+        if treatment == "own_brand":
+            assets = profile.get("assets") or {}
+            logo = _load_bgr_asset(
+                assets.get("logo_image_relative_path")
+                or assets.get("icon_image_relative_path")
+            )
+            out = _draw_brand_banner(
+                out,
+                point_bbox,
+                profile.get("product_name") or profile.get("brand_name") or "",
+                logo_image=logo,
+                min_height=point_height,
+            )
+        else:
+            out = _operator_inpaint_bbox_fast(
+                out,
+                _expand_bbox_ratio(point_bbox, frame_width, frame_height, 0.04, 0.06),
+                padding=4,
+                radius=5.0,
+            )
 
     return out
 
@@ -50020,9 +50060,12 @@ def _replacement_render_sync(
     # every source, including clean sources with zero tracks. That necessarily
     # produced an empty residual QA report, which was then misclassified as a
     # hard repair failure and blocked the entire edit.
-    preflight_dynamic_tracks = max(
-        0,
-        int(plan_summary.get("operator_dynamic_brand_expected_track_count") or 0),
+    # Recompute from the authoritative census. Cached plan summaries created
+    # before the confidence gate may contain false dynamic-track counts.
+    preflight_dynamic_tracks = 0
+    dynamic_candidate_declared = any(
+        str(anchor.get("kind") or "").lower() == "dynamic_watermark_candidate"
+        for anchor in (plan.get("persistent_watermark_anchor_boxes") or [])
     )
     if preflight_dynamic_tracks <= 0:
         preflight_census_rel = str(
@@ -50044,7 +50087,16 @@ def _replacement_render_sync(
                 )
                 strict = preflight_census.get("verified_dynamic_identity") or {}
                 if bool(strict.get("enabled")):
-                    preflight_dynamic_tracks = len(strict.get("tracks") or [])
+                    preflight_dynamic_tracks = sum(
+                        1
+                        for track in (strict.get("tracks") or [])
+                        if (
+                            (lambda scores: bool(scores) and sum(scores) / len(scores) >= 0.62)([
+                                float(point.get("template_score") or point.get("confidence") or 0.0)
+                                for point in (track.get("points") or track.get("waypoints") or [])
+                            ])
+                        )
+                    )
         except Exception:
             # The later normal renderer preflight still handles unreadable
             # reports. Do not turn optional temporal diagnostics into a false
@@ -50079,7 +50131,7 @@ def _replacement_render_sync(
     if (
         bool(getattr(req, "dynamic_watermark_temporal_recovery_enabled", False))
         and original_source_rel
-        and preflight_dynamic_tracks > 0
+        and (preflight_dynamic_tracks > 0 or dynamic_candidate_declared)
     ):
         # Run the dynamic-watermark temporal stage before the canonical
         # fixed/top/bottom/diagonal compositor. The compositor then sees one
@@ -50272,10 +50324,7 @@ def _replacement_render_sync(
                 "The original source is retained for the normal fixed-layer and editorial render.",
             ],
         }
-    expected_dynamic_tracks = max(
-        0,
-        int(plan_summary.get("operator_dynamic_brand_expected_track_count") or 0),
-    )
+    expected_dynamic_tracks = int(preflight_dynamic_tracks)
     if temporal_handoff and temporal_handoff.get("status") not in {"failed", "encode_failed"}:
         # Dynamic source watermark was already handled by the temporal stage.
         expected_dynamic_tracks = 0
@@ -50308,7 +50357,16 @@ def _replacement_render_sync(
             )
             strict = census.get("verified_dynamic_identity") or {}
             if bool(strict.get("enabled")):
-                expected_dynamic_tracks = len(strict.get("tracks") or [])
+                expected_dynamic_tracks = sum(
+                    1
+                    for track in (strict.get("tracks") or [])
+                    if (
+                        (lambda scores: bool(scores) and sum(scores) / len(scores) >= 0.62)([
+                            float(point.get("template_score") or point.get("confidence") or 0.0)
+                            for point in (track.get("points") or track.get("waypoints") or [])
+                        ])
+                    )
+                )
         except Exception:
             pass
 
@@ -50340,7 +50398,7 @@ def _replacement_render_sync(
                 (layout_payload.get("sources") or {}).get(source_rel)
                 or {}
             )
-            anchors = source_layout.get("anchors") or []
+            anchors = list(source_layout.get("anchors") or [])
             if (
                 anchors
                 and bool(getattr(req, "persistent_watermark_auto_from_source_layout", True))
@@ -51321,8 +51379,8 @@ def _production_verified_dynamic_track_count(plan: dict[str, Any]) -> int:
     """Return the strict dynamic-track count without treating broad candidates as marks."""
     summary = plan.get("summary") or {}
     count = max(0, int(summary.get("operator_dynamic_brand_expected_track_count") or 0))
-    if count > 0:
-        return count
+    # Do not trust the cached derived count blindly; old plans counted broad
+    # low-confidence template matches as dynamic watermarks.
 
     router_rel = str(((plan.get("source") or {}).get("router_report_relative_path") or "")).strip()
     try:
@@ -51333,7 +51391,15 @@ def _production_verified_dynamic_track_count(plan: dict[str, Any]) -> int:
             _, census = _read_json_workspace(router_rel, "production_execution_route")
             strict = census.get("verified_dynamic_identity") or {}
             if bool(strict.get("enabled")):
-                return len(strict.get("tracks") or [])
+                valid = []
+                for track in strict.get("tracks") or []:
+                    scores = [
+                        float(point.get("template_score") or point.get("confidence") or 0.0)
+                        for point in (track.get("points") or track.get("waypoints") or [])
+                    ]
+                    if scores and sum(scores) / len(scores) >= 0.62:
+                        valid.append(track)
+                return len(valid)
     except Exception:
         # A missing optional diagnostic must not turn an otherwise valid edit
         # into a false dynamic-watermark classification.
@@ -51442,9 +51508,21 @@ def _production_execution_route(
     # persistent ReelShort logo/offer panel that the generic census cannot
     # classify).  Without this, production silently selected the
     # ``dynamic_only`` route and never ran the fixed compositor.
-    fixed_present = bool(fixed_actions) or bool(plan.get("persistent_watermark_anchor_boxes"))
+    fixed_present = bool(fixed_actions) or any(
+        str(anchor.get("kind") or "fixed_watermark").lower() == "fixed_watermark"
+        for anchor in (plan.get("persistent_watermark_anchor_boxes") or [])
+    )
+    dynamic_candidate_present = any(
+        str(anchor.get("kind") or "").lower() == "dynamic_watermark_candidate"
+        for anchor in (plan.get("persistent_watermark_anchor_boxes") or [])
+    )
     dynamic_track_count = max(0, int(verified_dynamic_track_count or 0))
-    dynamic_present = dynamic_track_count > 0
+    # A declared dynamic candidate must keep the temporal detector enabled so
+    # it can discover the actual icon/logo/text trajectory. Previously the
+    # route saw zero cached tracks, classified the source as fixed-only, and
+    # rewrote the render request with temporal recovery disabled before the
+    # automatic detector ever ran.
+    dynamic_present = dynamic_track_count > 0 or dynamic_candidate_present
     watermark_present = bool(detected_watermark_present) or fixed_present or dynamic_present
     if fixed_present and dynamic_present:
         classification = "fixed_and_dynamic"
@@ -52961,6 +53039,24 @@ def _production_candidate_render_sync(
         and _operator_production_approved_action(action, req.include_review_actions)
         for action in actions
     )
+
+    # Fallback visual candidates are not production evidence.  Require the
+    # semantic boundary contract before replacing any mid-promo or end-card;
+    # otherwise a normal scene transition can be cut out as an ad.
+    for action in actions:
+        if action.get("type") not in {"mid_promo_replace", "end_card_replace"}:
+            continue
+        if action.get("status") == "REVIEW" and bool(req.include_review_actions):
+            if not bool(action.get("semantic_boundary_ready")):
+                raise HTTPException(
+                    status_code=422,
+                    detail={
+                        "stage": "production_candidate_render",
+                        "error": "editorial_boundary_evidence_required",
+                        "action_id": action.get("action_id"),
+                        "message": "Review-only editorial candidates require a confirmed semantic boundary before production replacement.",
+                    },
+                )
 
     if (
         bool(

@@ -6,9 +6,9 @@
       "review_status": "source_frame_verified",
       "description": "Persistent ReelShort logo, limited-time offer panel, and centre wordmark verified on source frames.",
       "anchors": [
-        {"id": "top_left_reelshort_logo", "x": 0.02, "y": 0.015, "width": 0.30, "height": 0.075},
-        {"id": "top_right_limited_offer", "x": 0.68, "y": 0.02, "width": 0.30, "height": 0.115},
-        {"id": "center_reelshort_wordmark", "x": 0.43, "y": 0.22, "width": 0.50, "height": 0.10}
+        {"id": "top_left_reelshort_logo", "kind": "fixed_watermark", "x": 0.02, "y": 0.015, "width": 0.30, "height": 0.075, "treatment": "inpaint"},
+        {"id": "top_right_non_brand_overlay", "kind": "ignored_overlay", "x": 0.68, "y": 0.02, "width": 0.30, "height": 0.115, "treatment": "ignore"},
+        {"id": "center_reelshort_dynamic_candidate", "kind": "dynamic_watermark_candidate", "x": 0.46, "y": 0.225, "width": 0.44, "height": 0.075, "treatment": "review_only"}
       ]
     },
     "raw/2026-08-16_0512/ReelShort/English/x_v_259079a89647cd48c07e492b716738a1.mp4": {
