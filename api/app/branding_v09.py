@@ -43217,8 +43217,12 @@ def _operator_apply_dynamic_wordmark_blur(frame, bbox, sigma):
     # Use the reviewed wordmark reference as the glyph support whenever it is
     # available. Scene-derived edge/contrast masks are unsafe: on a face they
     # happily select eyes, mouths and hair inside a broad tracking rectangle.
-    template_path = WORKSPACE / "config" / "dynamic_watermark_reference_reelshort_v2.png"
-    template = cv2.imread(str(template_path), cv2.IMREAD_GRAYSCALE) if template_path.exists() else None
+    template_candidates = [
+        WORKSPACE / "config" / "dynamic_watermark_reference_reelshort_v2.png",
+        WORKSPACE / "config" / "dynamic_watermark_reference_reelshort_v1.png",
+    ]
+    template_path = next((path for path in template_candidates if path.exists()), None)
+    template = cv2.imread(str(template_path), cv2.IMREAD_GRAYSCALE) if template_path else None
     if template is not None and template.size > 0:
         template_smooth = cv2.GaussianBlur(template, (0, 0), 7.0)
         template_glyph = np.where(
@@ -43238,7 +43242,7 @@ def _operator_apply_dynamic_wordmark_blur(frame, bbox, sigma):
             interpolation=cv2.INTER_LINEAR,
         )
         coverage = float(np.count_nonzero(local_mask)) / max(1.0, float(local_mask.size))
-        if 0.006 <= coverage <= 0.55:
+        if 0.001 <= coverage <= 0.80:
             stroke = {"mask": local_mask, "coverage_ratio": coverage, "source": "reviewed_template"}
         else:
             stroke = None
@@ -50110,6 +50114,7 @@ def _replacement_render_sync(
                 if sidecar_path.is_file():
                     sidecar = json.loads(sidecar_path.read_text(encoding="utf-8"))
                     diagnostic = sidecar.get("detail_identity_diagnostic") or {}
+                    identity_snapshot = sidecar.get("brand_identity_snapshot") or {}
                     brand_id = (
                         sidecar.get("brand_id")
                         or diagnostic.get("brand_id")
@@ -50131,7 +50136,14 @@ def _replacement_render_sync(
                             or product_name
                         ),
                     }
-                    profile_rel = diagnostic.get("brand_profile")
+                    for key in ("icon_relative_path", "logo_relative_path"):
+                        if not source_identity.get(key):
+                            source_identity[key] = identity_snapshot.get(key)
+                    profile_rel = (
+                        identity_snapshot.get("profile_relative_path")
+                        or sidecar.get("brand_profile")
+                        or diagnostic.get("brand_profile")
+                    )
                     if profile_rel:
                         profile_path = _safe_workspace_path(
                             profile_rel, must_exist=True
@@ -50496,6 +50508,27 @@ def _replacement_render_sync(
     summary["dynamic_watermark_temporal_recovery_enabled"] = bool(temporal_handoff)
     summary["dynamic_watermark_temporal_recovery_status"] = (
         temporal_handoff.get("status") if temporal_handoff else "disabled"
+    )
+    # Reflect actual work performed instead of the legacy constant ``False``.
+    # This field is consumed by task status and must not claim a no-op render
+    # as a modified source.
+    _visual_receipt = result.get("visual_base") or {}
+    _timeline_receipt = result.get("timeline") or []
+    summary["source_video_modified"] = bool(
+        int(_visual_receipt.get("top_composed_frames") or 0)
+        or int(_visual_receipt.get("bottom_brand_cover_frames") or 0)
+        or int(_visual_receipt.get("dynamic_brand_cover_frames") or 0)
+        or int(summary.get("mid_promo_replace_count") or 0)
+        or int(summary.get("end_card_replace_count") or 0)
+        or int(summary.get("end_card_append_count") or 0)
+        or any(
+            isinstance(event, dict)
+            and str(event.get("kind") or "") in {
+                "end_card_append", "end_card_replace", "mid_promo_replace",
+                "top_cleanup_brand_overlay", "bottom_cleanup_brand_overlay",
+            }
+            for event in _timeline_receipt
+        )
     )
     if temporal_handoff:
         summary["dynamic_watermark_temporal_recovery_report_relative_path"] = (
@@ -51371,7 +51404,7 @@ def _production_execution_route(
     accepted_actions = [
         action
         for action in (plan.get("actions") or [])
-        if action.get("status") != "REVIEW" or bool(include_review_actions)
+        if _operator_production_approved_action(action, include_review_actions)
     ]
     fixed_actions = [
         action for action in accepted_actions
@@ -51465,8 +51498,15 @@ def _production_execution_route(
             "watermark_treatment_mode": "rebrand_fixed_clean_dynamic" if fixed_present else "skip_no_fixed_watermark",
             "compose_top_brand_layers": bool(top_fixed_actions),
             "diagonal_brand_cover_enabled": fixed_present,
-            "persistent_watermark_auto_from_source_layout": fixed_present,
-            "persistent_watermark_required": fixed_present,
+            # A fixed logo is handled by its validated local top/bottom bbox.
+            # Never load a global layout merely because *some* fixed mark was
+            # detected: stale layouts are a common source of extra masks.
+            "persistent_watermark_auto_from_source_layout": bool(
+                plan.get("persistent_watermark_anchor_boxes")
+            ),
+            "persistent_watermark_required": bool(
+                plan.get("persistent_watermark_anchor_boxes")
+            ),
             "dynamic_watermark_temporal_recovery_enabled": dynamic_present,
             # The temporal stage owns all dynamic work; old broad moving
             # actions are intentionally excluded from the downstream renderer.
@@ -52917,15 +52957,8 @@ def _production_candidate_render_sync(
         )
 
     has_mid_promo_action = any(
-        action.get("type")
-        == "mid_promo_replace"
-        and (
-            action.get("status")
-            != "REVIEW"
-            or bool(
-                req.include_review_actions
-            )
-        )
+        action.get("type") == "mid_promo_replace"
+        and _operator_production_approved_action(action, req.include_review_actions)
         for action in actions
     )
 
@@ -75133,7 +75166,7 @@ def _operator_midpromo_actions(plan):
 
 def _operator_midpromo_user_boundary_override(plan, profile, source_context):
     """Use a user-confirmed boundary only for the matching source SHA-256."""
-    if _operator_midpromo_actions(plan):
+    if _operator_production_midpromo_actions(plan):
         return {"used": False, "reason": "midpromo_action_already_present", "action_added": False}
 
     source_sha256 = str((source_context or {}).get("sha256") or "").casefold()
@@ -75212,7 +75245,7 @@ def _operator_midpromo_user_boundary_override(plan, profile, source_context):
 
 def _operator_midpromo_fullscreen_insert_fallback(plan, profile, source_context, semantic=None):
     """Create a REVIEW-only action for a generic full-screen interruption."""
-    if _operator_midpromo_actions(plan):
+    if _operator_production_midpromo_actions(plan):
         return {"used": False, "reason": "midpromo_action_already_present", "action_added": False}
     source_rel = str((source_context or {}).get("relative_path") or "")
     if not source_rel:
@@ -75318,12 +75351,12 @@ def _operator_midpromo_semantic_activity_fallback(
     sides.  This preserves the no-guessing rule while covering the specific
     failure mode where the router has no brand-text anchor at all.
     """
-    if _operator_midpromo_actions(plan):
+    if _operator_production_midpromo_actions(plan):
         return {
             "used": False,
             "reason": "midpromo_action_already_present",
             "action_added": False,
-            "candidate_count": len(_operator_midpromo_actions(plan)),
+            "candidate_count": len(_operator_production_midpromo_actions(plan)),
             "report_relative_path": (semantic or {}).get("report_relative_path"),
         }
 
@@ -75509,11 +75542,11 @@ def _operator_midpromo_semantic_activity_fallback(
 
 
 def _operator_midpromo_recovery(plan, profile, router):
-    if _operator_midpromo_actions(plan):
+    if _operator_production_midpromo_actions(plan):
         return {
             "used": False,
             "reason": "semantic_midpromo_action_present",
-            "candidate_count": len(_operator_midpromo_actions(plan)),
+            "candidate_count": len(_operator_production_midpromo_actions(plan)),
             "action_added": False,
             "report_relative_path": None,
         }
@@ -75667,13 +75700,13 @@ def _operator_ensure_core_brand_actions(
         for action in actions
         if (
             action.get("type") == "fixed_brand_overlay"
+            and _operator_production_approved_action(action)
             and (
                 str(action.get("placement") or "").startswith("top_")
                 or action.get("handler") == "top_cleanup_brand_overlay"
             )
         )
     ]
-
     # Remove stale top actions that were created from a terminal census
     # cluster.  Older plans promoted an end-card logo to a full-story top
     # overlay, which explains the incorrect cover position in the latest
@@ -75710,7 +75743,8 @@ def _operator_ensure_core_brand_actions(
             if not bbox:
                 continue
 
-            action["status"] = "AUTO"
+            # Preserve the planner's evidence/status.  A REVIEW action must
+            # remain review-only instead of being silently promoted to AUTO.
             action["handler"] = "top_cleanup_brand_overlay"
             action["bbox"] = bbox
             action["active_segments"] = [
@@ -75839,6 +75873,7 @@ def _operator_ensure_core_brand_actions(
     bottom_actions = [
         action for action in actions
         if action.get("type") == "fixed_brand_overlay"
+        and _operator_production_approved_action(action)
         and _operator_fixed_action_vertical_zone(action, width, height) == "bottom"
     ]
     if not bottom_actions:
@@ -75904,10 +75939,7 @@ def _operator_ensure_core_brand_actions(
             )
 
     def _production_approved(action):
-        if str(action.get("status") or "").upper() != "REVIEW":
-            return True
-        candidate = action.get("source_candidate") or {}
-        return bool(candidate.get("user_confirmed") or action.get("user_confirmed"))
+        return _operator_production_approved_action(action)
 
     has_end = any(
         action.get("type") == "end_card_replace"
@@ -76053,6 +76085,33 @@ def _operator_ensure_core_brand_actions(
     return plan
 
 
+def _operator_production_midpromo_actions(plan, include_review=False):
+    return [
+        action for action in ((plan or {}).get("actions") or [])
+        if action.get("type") == "mid_promo_replace"
+        and _operator_production_approved_action(action, include_review)
+    ]
+
+
+def _operator_production_approved_action(action, include_review=False):
+    """Return whether an action is safe to execute in the production route."""
+    if not isinstance(action, dict):
+        return False
+    candidate = action.get("source_candidate") or {}
+    if bool(candidate.get("requires_human_review")) and not bool(
+        action.get("user_confirmed") or candidate.get("user_confirmed")
+    ):
+        return False
+    status = str(action.get("status") or "").upper()
+    if status != "REVIEW":
+        return True
+    return bool(
+        include_review
+        or action.get("user_confirmed")
+        or candidate.get("user_confirmed")
+    )
+
+
 def _operator_branding_business_qc(
     rendered,
     source_context,
@@ -76071,15 +76130,18 @@ def _operator_branding_business_qc(
         plan_summary.get("operator_top_brand_required")
         or int(summary.get("top_brand_action_count") or 0) > 0
     )
-    fixed_expected = bool(_operator_route_layers_of_type(router, "fixed_strong"))
-    end_card_expected = bool(_operator_route_layers_of_type(router, "end_card"))
-    # Production renders with include_review_actions=False. Keep business QC
-    # aligned with that execution contract so an unconfirmed REVIEW action is
-    # not treated as a required render that the renderer must skip.
+    approved_actions = [
+        action for action in (plan.get("actions") or [])
+        if _operator_production_approved_action(action)
+    ]
+    fixed_expected = any(
+        action.get("type") == "fixed_brand_overlay" for action in approved_actions
+    )
+    end_card_expected = any(
+        action.get("type") == "end_card_replace" for action in approved_actions
+    )
     mid_promo_expected = any(
-        action.get("type") == "mid_promo_replace"
-        and str(action.get("status") or "").upper() != "REVIEW"
-        for action in (plan.get("actions") or [])
+        action.get("type") == "mid_promo_replace" for action in approved_actions
     )
     temporal_repair_completed = str(
         summary.get("dynamic_watermark_temporal_recovery_status") or ""
@@ -77191,11 +77253,11 @@ def _operator_process_video(
         dynamic_track_source_counts
     )
 
-    if _operator_midpromo_actions(plan):
+    if _operator_production_midpromo_actions(plan):
         midpromo_recovery = {
             "used": False,
             "reason": "semantic_midpromo_action_present",
-            "candidate_count": len(_operator_midpromo_actions(plan)),
+            "candidate_count": len(_operator_production_midpromo_actions(plan)),
             "action_added": False,
             "report_relative_path": None,
         }
@@ -77210,7 +77272,7 @@ def _operator_process_video(
         # OCR.  Prefer the sequential fullscreen scan (which also hands its
         # scene cuts to the semantic-activity recovery) and invoke the legacy
         # census only when the fast route cannot identify a bounded segment.
-        if not _operator_midpromo_actions(plan):
+        if not _operator_production_midpromo_actions(plan):
             fullscreen_recovery = run_stage(
                 "midpromo_fullscreen_recovery",
                 "Mid Promo 语义未命中 · 快速检测全屏插播结构",
@@ -77223,7 +77285,7 @@ def _operator_process_video(
                 "fullscreen_insert_fallback": fullscreen_recovery,
             }
 
-        if not _operator_midpromo_actions(plan):
+        if not _operator_production_midpromo_actions(plan):
             activity_recovery = run_stage(
                 "midpromo_activity_recovery",
                 "Mid Promo 无 OCR 锚点 · 以画面活动与场景边界复核",
@@ -77239,7 +77301,7 @@ def _operator_process_video(
                 "semantic_activity_fallback": activity_recovery,
             }
 
-        if not _operator_midpromo_actions(plan):
+        if not _operator_production_midpromo_actions(plan):
             # Do not turn an unbounded/uncertain interruption into a slow
             # destructive edit.  The review UI retains the source and exposes
             # the no-match reason; a user boundary override remains available
@@ -77256,7 +77318,7 @@ def _operator_process_video(
             }
 
     plan.setdefault("summary", {})["mid_promo_replace_count"] = len(
-        _operator_midpromo_actions(plan)
+        _operator_production_midpromo_actions(plan)
     )
 
     # Persist operator-added recovery actions before the production renderer
@@ -77407,6 +77469,50 @@ def _operator_process_video(
                 ),
                 "branding_business_qc": (
                     branding_business_qc
+                ),
+            },
+        )
+
+    # A technically valid MP4 is not sufficient for a production success.  A
+    # renderer can legitimately re-encode/copy a source while applying zero
+    # requested operations; reject that no-op so the UI cannot report a false
+    # "editing complete" result.  Receipts come from the actual compositor,
+    # temporal repair, editorial replacement, or own end-card append stage.
+    render_summary = rendered.get("summary") or {}
+    render_visual = rendered.get("visual_base") or {}
+    timeline = rendered.get("timeline") or []
+    effective_receipts = (
+        int(branding_business_qc.get("top_composed_frames") or 0)
+        + int(branding_business_qc.get("bottom_brand_cover_frames") or 0)
+        + int(branding_business_qc.get("dynamic_cover_frames") or 0)
+        + int(branding_business_qc.get("mid_promo_replace_count") or 0)
+        + int(branding_business_qc.get("end_card_replace_count") or 0)
+        + int(branding_business_qc.get("end_card_append_count") or 0)
+        + int(render_summary.get("end_card_append_count") or 0)
+        + int(render_visual.get("top_composed_frames") or 0)
+        + int(render_visual.get("bottom_brand_cover_frames") or 0)
+    )
+    temporal_status = str(
+        render_summary.get("dynamic_watermark_temporal_recovery_status") or ""
+    ).lower()
+    temporal_done = temporal_status in {"completed", "success", "ok"}
+    timeline_receipt = any(
+        str(event.get("kind") or "") in {
+            "end_card_append", "end_card_replace", "mid_promo_replace",
+            "top_cleanup_brand_overlay", "bottom_cleanup_brand_overlay",
+            "dynamic_watermark_temporal_repair",
+        }
+        for event in timeline if isinstance(event, dict)
+    )
+    if effective_receipts <= 0 and not temporal_done and not timeline_receipt:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "stage": "operator_branding",
+                "error": "render_no_effective_operation",
+                "message": (
+                    "The output is technically valid but no watermark, editorial, "
+                    "or own-brand operation produced a render receipt."
                 ),
             },
         )
