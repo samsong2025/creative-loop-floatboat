@@ -37070,14 +37070,35 @@ def _fallback_semantic_brand_segments(semantic_report, duration_override: float 
     ]
     if len(interior) >= 2:
         times = [float(item.get("time_seconds") or 0.0) for item in interior]
-        if max(times) - min(times) >= 2.0:
+        candidate_duration = max(times) - min(times) + 3.0
+
+        # OCR sees a persistent "Limited-time offer" banner on many ReelShort
+        # story frames. Treating that repeated banner as a sustained promo
+        # episode produced a 1.5-64.5s replacement covering the entire story.
+        # A fallback candidate must be bounded and visually interstitial: if
+        # narrative subtitles remain present across the evidence, this is an
+        # overlay on story, not a full-screen insert.
+        narrative_activity = [
+            float((item.get("text_layer_activity") or {}).get("narrative_subtitle_activity") or 0.0)
+            for item in interior
+        ]
+        narrative_story_ratio = (
+            sum(value >= 0.50 for value in narrative_activity) / len(narrative_activity)
+            if narrative_activity else 1.0
+        )
+
+        if (
+            max(times) - min(times) >= 2.0
+            and 4.0 <= candidate_duration <= 40.0
+            and narrative_story_ratio < 0.50
+        ):
             segments.insert(0, {
                 "segment_id": "fallback-interior-brand-promo",
                 "type": "mid_promo_candidate",
                 "status": "REVIEW",
                 "start_seconds": round(max(0.0, min(times) - 1.5), 3),
                 "end_seconds": round(min(duration, max(times) + 1.5), 3),
-                "duration_seconds": round(max(times) - min(times) + 3.0, 3),
+                "duration_seconds": round(candidate_duration, 3),
                 "start_source": "sustained_promo_score_backtrack",
                 "end_source": "sustained_promo_score_forward",
                 "fallback_reason": "sustained_promo_visual_or_ocr_evidence_without_semantic_episode",

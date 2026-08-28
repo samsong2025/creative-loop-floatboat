@@ -61,6 +61,7 @@ from app.branding_v09 import (
     _operator_dynamic_brand_tracks_from_census,
     _operator_interpolated_dynamic_bbox,
     _operator_branding_business_qc,
+    _fallback_semantic_brand_segments,
     _source_icon_watermark_hit,
     _strict_verified_identity_tracks,
     _strict_verified_visual_tracks,
@@ -848,6 +849,42 @@ def test_business_qc_ignores_unconfirmed_review_midpromo():
     assert result["ok"] is True
 
 
+def test_fallback_midpromo_rejects_persistent_banner_over_story():
+    # A static "Limited-time offer" banner is present in OCR on every sample,
+    # while narrative subtitles remain visible. This must not become a
+    # whole-story mid-promo replacement candidate.
+    timeline = [
+        {
+            "time_seconds": float(t),
+            "smoothed_scores": {"promo": 0.69},
+            "text_layer_activity": {"narrative_subtitle_activity": 1.0},
+        }
+        for t in (3, 6, 9, 12, 15, 18, 21, 24, 27, 30, 33, 36, 39, 42, 45, 48, 51, 54, 57, 60, 63)
+    ]
+    result = _fallback_semantic_brand_segments(
+        {"semantic_timeline": timeline, "video": {"duration_seconds": 98.667}},
+    )
+    assert not any(item.get("type") == "mid_promo_candidate" for item in result)
+
+
+def test_fallback_midpromo_keeps_bounded_fullscreen_candidate():
+    # A short interstitial with no narrative subtitle layer remains reviewable.
+    timeline = [
+        {
+            "time_seconds": float(t),
+            "smoothed_scores": {"promo": 0.70},
+            "text_layer_activity": {"narrative_subtitle_activity": 0.0},
+        }
+        for t in (30, 33, 36, 39)
+    ]
+    result = _fallback_semantic_brand_segments(
+        {"semantic_timeline": timeline, "video": {"duration_seconds": 98.667}},
+    )
+    mid = [item for item in result if item.get("type") == "mid_promo_candidate"]
+    assert len(mid) == 1
+    assert mid[0]["duration_seconds"] <= 40.0
+
+
 def test_default_floatboat_replacement_assets_are_configured():
     root = Path(__file__).resolve().parents[1]
     workspace = root / "workspace"
@@ -902,5 +939,7 @@ if __name__ == "__main__":
     test_reviewed_visual_track_accepts_two_point_brief_motion()
     test_low_score_visual_recovery_requires_strong_native_anchors()
     test_business_qc_ignores_unconfirmed_review_midpromo()
+    test_fallback_midpromo_rejects_persistent_banner_over_story()
+    test_fallback_midpromo_keeps_bounded_fullscreen_candidate()
     test_default_floatboat_replacement_assets_are_configured()
     print("strict moving-watermark policy regressions passed")
