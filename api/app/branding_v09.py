@@ -1027,10 +1027,7 @@ def _word_window_candidates(words: list[dict[str, Any]], target: str) -> list[di
 
 
 def _report_candidate_times(report: dict[str, Any], threshold: float) -> list[dict[str, Any]]:
-    # Keep glyph-like components long enough to merge them on their deskewed
-    # baseline. Counting letters independently can turn one moving word into
-    # a false diagonal tiled grid.
-    fragments = []
+    hits = []
 
     for det in report.get("detections") or []:
         try:
@@ -7592,7 +7589,10 @@ def _diag_component_hits(
         connectivity=8,
     )
 
-    hits = []
+    # Keep glyph-like components long enough to merge them on their deskewed
+    # baseline. Counting letters independently can turn one moving word into
+    # a false diagonal tiled grid.
+    fragments = []
     for label in range(1, num_labels):
         x = int(stats[label, cv2.CC_STAT_LEFT])
         y = int(stats[label, cv2.CC_STAT_TOP])
