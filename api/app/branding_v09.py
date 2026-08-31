@@ -1909,7 +1909,6 @@ def _fit_to_width(frame, target_width: int):
 
 def _label_pane(frame, label: str):
     out = frame.copy()
-    frame_height, frame_width = out.shape[:2]
     cv2.rectangle(out, (0, 0), (min(out.shape[1], 175), 34), (0, 0, 0), thickness=-1)
     cv2.putText(
         out,
@@ -2284,7 +2283,7 @@ def _dynamic_visual_reference_template_paths():
 
 
 def _dynamic_visual_template_paths(req):
-    """Return a bank of icon, logo and brand-name templates for dynamic marks."""
+    """Return material-bound icon/logo templates before generic fallbacks."""
     paths = []
     for value in (
         getattr(req, "source_icon_relative_path", None),
@@ -2298,28 +2297,6 @@ def _dynamic_visual_template_paths(req):
             continue
         if candidate.is_file() and candidate not in paths:
             paths.append(candidate)
-    # Generate a lightweight text template when a product/brand name is
-    # available.  Dynamic watermarks are often rendered as text rather than
-    # the square acquisition icon; keeping this candidate in the same bank
-    # lets temporal scoring select whichever form is actually present.
-    text_value = str(
-        getattr(req, "source_product_name", None)
-        or getattr(req, "source_app_title", None)
-        or ""
-    ).strip()
-    if text_value:
-        try:
-            import hashlib
-            safe = hashlib.sha1(text_value.encode("utf-8")).hexdigest()[:12]
-            text_path = WORKSPACE / "config" / f"dynamic_text_template_{safe}.png"
-            if not text_path.is_file():
-                canvas = np.zeros((96, 420), dtype=np.uint8)
-                cv2.putText(canvas, text_value[:28], (6, 66), cv2.FONT_HERSHEY_SIMPLEX, 1.45, 255, 3, cv2.LINE_AA)
-                cv2.imwrite(str(text_path), canvas)
-            if text_path.is_file() and text_path not in paths:
-                paths.append(text_path)
-        except Exception:
-            pass
     # Keep generic templates in the compatibility list for diagnostics and old
     # callers. Production scan selection below is product-identity first and
     # will not use these templates when a source-specific asset is available.
@@ -2575,7 +2552,7 @@ def _dynamic_visual_track_report(candidates, width, height, interval, req):
             scale_ratio = max(last_area, candidate_area) / min(last_area, candidate_area)
             native_edge_pair = bool(candidate.get("edge_reference")) and bool(last.get("edge_reference"))
             maximum_motion = (
-                max(28.0, float(candidate_bbox["width"]) * 0.14)
+                max(28.0, float(candidate_bbox["width"]) * 0.14, float(min(width, height)) * 0.06)
                 if native_edge_pair
                 else max(45.0, min(float(candidate_bbox["width"]) * 0.45, float(width) * 0.32))
             )
@@ -2601,7 +2578,7 @@ def _dynamic_visual_track_report(candidates, width, height, interval, req):
         # path and can also make the renderer paint the same mark repeatedly.
         best_by_time = {}
         for point in track["points"]:
-            time_key = round(float(point["time_seconds"]), 3)
+            time_key = int(point.get("frame_index") or round(float(point["time_seconds"]) * 30.0))
             previous = best_by_time.get(time_key)
             if previous is None or float(point.get("template_score") or 0.0) > float(
                 previous.get("template_score") or 0.0
@@ -2698,7 +2675,26 @@ def _dynamic_visual_watermark_scan(video_path, *, width, height, duration, ocr_h
         item for item in templates
         if item[0].name not in reviewed_template_names
     ]
-    scan_templates = source_templates or native_templates or reviewed_templates or templates
+    # A source icon is an identity anchor, not necessarily the moving mark
+    # geometry. ReelShort samples can contain a corner icon plus a separate wide
+    # translucent REELSHORT wordmark across the story. Include the reviewed wide
+    # reference for this explicit source identity to avoid false square tracks.
+    source_identity_text = " ".join(
+        str(value or "")
+        for value in (
+            getattr(req, "source_brand_id", None),
+            getattr(req, "source_product_name", None),
+            getattr(req, "source_app_title", None),
+        )
+    ).casefold()
+    if "reelshort" in source_identity_text and native_templates:
+        # For this brand the reviewed v2 asset is the wide translucent
+        # REELSHORT wordmark. The acquired square icon remains available as an
+        # identity anchor for fixed-corner handling, but must not drive dynamic
+        # geometry.
+        scan_templates = native_templates
+    else:
+        scan_templates = source_templates or native_templates or reviewed_templates or templates
 
     # Detection-only review can request frame-level cadence (roughly 1/30s)
     # to audit short fades and gaps.  Production callers still choose their
@@ -3291,7 +3287,7 @@ def _strict_verified_visual_tracks(visual_payload, width, height, policy, durati
         for point in raw_points:
             try:
                 normalized = {
-                    "time_seconds": round(float(point.get("time_seconds") or 0.0), 3),
+                    "time_seconds": round(float(point.get("time_seconds") or 0.0), 6),
                     "bbox": _clip_bbox(point["bbox"], int(width), int(height)),
                     "template_score": round(float(point.get("template_score") or 0.0), 4),
                     "template_relative_path": point.get("template_relative_path"),
@@ -19818,10 +19814,25 @@ def _replacement_plan_sync(
                     "handler": "fixed_banner_replace",
                     "placement": placement,
                     "bbox": bbox,
-                    "active_segments": _fixed_active_segments_for_layer(
-                        layer,
-                        source_rel,
+                    "source_full_cover_bbox": _expand_bbox_ratio(
+                        bbox, width, height, 0.12, 0.16,
                     ),
+                    "active_segments": [
+                        {
+                            **segment,
+                            "source_full_cover_bbox": _expand_bbox_ratio(
+                                segment.get("bbox") or bbox,
+                                width,
+                                height,
+                                0.12,
+                                0.16,
+                            ),
+                        }
+                        for segment in _fixed_active_segments_for_layer(
+                            layer,
+                            source_rel,
+                        )
+                    ],
                     "strategy": strategy,
                     "replacement_content": {
                         "product_name": profile[
@@ -22781,10 +22792,25 @@ def _replacement_plan_sync(
                     "handler": handler,
                     "placement": placement,
                     "bbox": bbox,
-                    "active_segments": _fixed_active_segments_for_layer(
-                        layer,
-                        source_rel,
+                    "source_full_cover_bbox": _expand_bbox_ratio(
+                        bbox, width, height, 0.12, 0.16,
                     ),
+                    "active_segments": [
+                        {
+                            **segment,
+                            "source_full_cover_bbox": _expand_bbox_ratio(
+                                segment.get("bbox") or bbox,
+                                width,
+                                height,
+                                0.12,
+                                0.16,
+                            ),
+                        }
+                        for segment in _fixed_active_segments_for_layer(
+                            layer,
+                            source_rel,
+                        )
+                    ],
                     "strategy": strategy,
                     "replacement_content": {
                         "product_name": profile[
@@ -37094,22 +37120,23 @@ def _fallback_semantic_brand_segments(semantic_report, duration_override: float 
     if len(interior) >= 2:
         times = [float(item.get("time_seconds") or 0.0) for item in interior]
         candidate_duration = max(times) - min(times) + 3.0
-
-        # OCR sees a persistent "Limited-time offer" banner on many ReelShort
-        # story frames.  Treating that repeated banner as a sustained promo
-        # episode produced a 1.5-64.5s replacement covering the entire story.
-        # A fallback mid-promo candidate must therefore be both bounded and
-        # visually interstitial: if narrative subtitles remain present across
-        # the evidence, this is an overlay on story, not a full-screen insert.
+        # A persistent CTA banner can score as promo throughout narrative story
+        # footage. A fallback candidate must remain bounded and visually
+        # interstitial; it may never turn a subtitle-heavy story span into a
+        # destructive mid-promo proposal.
         narrative_activity = [
-            float((item.get("text_layer_activity") or {}).get("narrative_subtitle_activity") or 0.0)
+            float(
+                (item.get("text_layer_activity") or {}).get(
+                    "narrative_subtitle_activity"
+                )
+                or 0.0
+            )
             for item in interior
         ]
         narrative_story_ratio = (
             sum(value >= 0.50 for value in narrative_activity) / len(narrative_activity)
             if narrative_activity else 1.0
         )
-
         if (
             max(times) - min(times) >= 2.0
             and 4.0 <= candidate_duration <= 40.0
@@ -37124,7 +37151,7 @@ def _fallback_semantic_brand_segments(semantic_report, duration_override: float 
                 "duration_seconds": round(candidate_duration, 3),
                 "start_source": "sustained_promo_score_backtrack",
                 "end_source": "sustained_promo_score_forward",
-                "fallback_reason": "sustained_promo_visual_or_ocr_evidence_without_semantic_episode",
+                "fallback_reason": "bounded_interstitial_promo_evidence_without_semantic_episode",
             })
     return segments
 
@@ -40049,6 +40076,11 @@ class BrandingReplacementPreviewRequest(BaseModel):
     mid_promo_transition_score_multiplier: float = 1.65
     mid_promo_transition_max_extra_frames: int = 8
 
+    # A reviewed request can lock the terminal cut to its manual semantic onset
+    # by passing a zero guard; the default keeps the ordinary safety pre-roll.
+    end_card_boundary_guard_frames: int = 12
+    end_card_boundary_scan_interval_seconds: float = 0.05
+
     # Terminal cards often begin with a short logo/name fade before the large
     # scene change that the generic end-card detector locks onto.  Keep this
     # separate from Mid Promo guards: the terminal replacement owns the rest of
@@ -41632,6 +41664,11 @@ class BrandingReplacementRenderRequest(BaseModel):
     mid_promo_transition_score_multiplier: float = 1.65
     mid_promo_transition_max_extra_frames: int = 8
 
+    # A reviewed request can lock the terminal cut to its manual semantic onset
+    # by passing a zero guard; the default keeps the ordinary safety pre-roll.
+    end_card_boundary_guard_frames: int = 12
+    end_card_boundary_scan_interval_seconds: float = 0.05
+
     # Placeholder durations when real assets are absent.
     placeholder_mid_promo_seconds: float = 3.0
     placeholder_end_card_seconds: float = 3.0
@@ -42120,7 +42157,7 @@ def _operator_dynamic_brand_tracks_from_census(
                     continue
                 try:
                     points.append({
-                        "time_seconds": round(float(point.get("time_seconds") or 0.0), 3),
+                        "time_seconds": round(float(point.get("time_seconds") or 0.0), 6),
                         "bbox": _clip_bbox(bbox, width, height),
                         "similarity": float(point.get("similarity") or point.get("template_score") or 0.0),
                         "ocr_confidence": float(point.get("ocr_confidence") or 0.0),
@@ -42206,7 +42243,7 @@ def _operator_dynamic_brand_tracks_from_census(
                 continue
             points.append(
                 {
-                    "time_seconds": round(float(point.get("time_seconds") or 0.0), 3),
+                    "time_seconds": round(float(point.get("time_seconds") or 0.0), 6),
                     "bbox": _clip_bbox(bbox, width, height),
                     "similarity": float(point.get("template_score") or 0.0),
                     "ocr_confidence": 0.0,
@@ -42658,6 +42695,54 @@ def _operator_temporal_tracks_from_census(census_report_relative_path):
         )
     except Exception:
         return []
+    # The reviewed full-frame census endpoint stores normalized trajectories in
+    # ``detector.tracks`` and video metadata in ``source``.  It is already the
+    # authoritative 15-track handoff, so converting it through the historical
+    # pixel-box/OCR census adapter would silently return no tracks and trigger a
+    # second detector pass.  Preserve its IDs, frame clock, exact waypoint
+    # windows and template provenance verbatim (aside from numeric validation).
+    reviewed_tracks = list((report.get("detector") or {}).get("tracks") or [])
+    reviewed_source = report.get("source") or {}
+    if reviewed_tracks and int(reviewed_source.get("width") or 0) > 0 and int(reviewed_source.get("height") or 0) > 0:
+        reviewed_fps = float(reviewed_source.get("fps") or 30.0)
+        direct = []
+        for index, track in enumerate(reviewed_tracks, 1):
+            points = []
+            for point in track.get("waypoints") or []:
+                bbox = point.get("bbox") or []
+                if not isinstance(bbox, (list, tuple)) or len(bbox) != 4:
+                    continue
+                try:
+                    normalized = [max(0.0, min(1.0, float(value))) for value in bbox]
+                    frame_index = int(point.get("frame_index") or round(float(point.get("t") or 0.0) * reviewed_fps))
+                except (TypeError, ValueError):
+                    continue
+                if normalized[2] <= normalized[0] or normalized[3] <= normalized[1]:
+                    continue
+                points.append({
+                    "frame_index": frame_index,
+                    "t": frame_index / reviewed_fps,
+                    "frame_clock": "source_frame_index",
+                    "bbox": normalized,
+                    "confidence": float(point.get("confidence") or point.get("template_score") or 0.0),
+                    "template_relative_path": point.get("template_relative_path"),
+                })
+            points.sort(key=lambda value: int(value["frame_index"]))
+            if len(points) < 2:
+                continue
+            direct.append({
+                "track_id": str(track.get("track_id") or track.get("cluster_id") or f"reviewed-{index:02d}"),
+                "visibility_window": [points[0]["t"], points[-1]["t"]],
+                "max_interpolation_gap_seconds": float(track.get("max_interpolation_gap_seconds") or 0.45),
+                "tracking_policy": track.get("tracking_policy") or "verified_identity_only__no_pre_or_post_extrapolation__hide_on_tracking_gap",
+                "waypoints": points,
+                "point_count": len(points),
+                "movement_px": track.get("movement_px"),
+                "identity_evidence": track.get("identity_evidence") or "reviewed_fullframe_census",
+            })
+        if direct:
+            return direct
+
     video = report.get("video") or {}
     try:
         width, height = int(video.get("width") or 0), int(video.get("height") or 0)
@@ -42676,7 +42761,9 @@ def _operator_temporal_tracks_from_census(census_report_relative_path):
                 x1 = max(x0, min(1.0, (float(bbox.get("x")) + float(bbox.get("width"))) / width))
                 y1 = max(y0, min(1.0, (float(bbox.get("y")) + float(bbox.get("height"))) / height))
                 waypoint = {
-                    "t": round(float(point.get("time_seconds")), 3),
+                    "frame_index": int(point.get("frame_index") or round(float(point.get("time_seconds")) * float(video.get("fps") or 30.0))),
+                    "t": int(point.get("frame_index") or round(float(point.get("time_seconds")) * float(video.get("fps") or 30.0))) / float(video.get("fps") or 30.0),
+                    "frame_clock": "source_frame_index",
                     "bbox": [x0, y0, x1, y1],
                     "confidence": float(point.get("similarity") or point.get("template_score") or 0.0),
                 }
@@ -42684,7 +42771,7 @@ def _operator_temporal_tracks_from_census(census_report_relative_path):
                 continue
             if x1 > x0 and y1 > y0:
                 waypoints.append(waypoint)
-        waypoints.sort(key=lambda value: value["t"])
+        waypoints.sort(key=lambda value: int(value.get("frame_index") or round(float(value["t"]) * 30.0)))
         if len(waypoints) < 2:
             continue
         converted.append({
@@ -43265,6 +43352,10 @@ def _operator_apply_dynamic_wordmark_blur(frame, bbox, sigma):
             interpolation=cv2.INTER_LINEAR,
         )
         coverage = float(np.count_nonzero(local_mask)) / max(1.0, float(local_mask.size))
+        # Reviewed references are authoritative even when their alpha/contrast
+        # is sparse after resizing into a wide tracking box.  Accept any
+        # non-empty support while retaining an upper bound against full-frame
+        # templates.
         if 0.001 <= coverage <= 0.80:
             stroke = {"mask": local_mask, "coverage_ratio": coverage, "source": "reviewed_template"}
         else:
@@ -44403,6 +44494,231 @@ def _operator_fixed_action_vertical_zone(action, width=0, height=0):
     return "top"
 
 
+def _operator_action_requires_explicit_confirmation(action: dict[str, Any]) -> bool:
+    """Whether a destructive editorial action requires user confirmation.
+
+    A detected in-story interruption is evidence for a *review candidate*, not
+    authority to remove story.  Historical fallback code promoted candidates
+    from semantic/fullscreen scans to AUTO, which let a false positive delete a
+    perfectly valid story span and replace it with an own mid-promo.
+    """
+    if not isinstance(action, dict):
+        return False
+    if str(action.get("type") or "") != "mid_promo_replace":
+        return False
+    source_candidate = action.get("source_candidate") or {}
+    return not bool(
+        action.get("user_confirmed")
+        or source_candidate.get("user_confirmed")
+        or str(action.get("decision_source") or "")
+        == "user_review_confirmed_boundary"
+    )
+
+
+def _operator_plan_source_sha256(plan: dict[str, Any]) -> str:
+    """Return the source SHA-256 declared by the render plan."""
+    source = (plan or {}).get("source") or {}
+    identity = source.get("source_identity") or {}
+    for candidate in (
+        source.get("sha256"),
+        source.get("source_sha256"),
+        identity.get("sha256"),
+        identity.get("source_sha256"),
+        (plan or {}).get("source_sha256"),
+    ):
+        value = str(candidate or "").strip().casefold()
+        if re.fullmatch(r"[0-9a-f]{64}", value):
+            return value
+    return ""
+
+
+def _operator_midpromo_has_source_bound_confirmation(
+    action: dict[str, Any], plan: dict[str, Any]
+) -> bool:
+    """Require a matching SHA-256 for any destructive in-story replacement."""
+    if _operator_action_requires_explicit_confirmation(action):
+        return False
+    candidate = action.get("source_candidate") or {}
+    action_sha256 = str(
+        candidate.get("source_sha256") or action.get("source_sha256") or ""
+    ).strip().casefold()
+    plan_sha256 = _operator_plan_source_sha256(plan)
+    return bool(
+        re.fullmatch(r"[0-9a-f]{64}", action_sha256)
+        and plan_sha256
+        and action_sha256 == plan_sha256
+    )
+
+
+def _operator_validate_editorial_actions_for_render(
+    plan: dict[str, Any],
+    actions: list[dict[str, Any]],
+    *,
+    include_review_actions: bool,
+) -> None:
+    """Fail closed on destructive in-story replacements without source proof.
+
+    ``include_review_actions`` controls whether a reviewer may preview review
+    cards. It is not blanket consent to cut source-story footage. A Mid Promo
+    requires both an explicit user decision and the exact SHA-256 of the plan's
+    source; terminal end-card replacement follows its separate review path.
+    """
+    unconfirmed = [
+        action
+        for action in actions
+        if str(action.get("type") or "") == "mid_promo_replace"
+        and not _operator_midpromo_has_source_bound_confirmation(action, plan)
+    ]
+    if not unconfirmed:
+        return
+    raise HTTPException(
+        status_code=422,
+        detail={
+            "stage": "replacement_render_editorial_authorization",
+            "error": "mid_promo_requires_explicit_user_confirmation",
+            "message": (
+                "An in-story Mid Promo replacement cannot run from detector, "
+                "semantic, or fullscreen evidence alone. Keep the source story "
+                "and request an explicit user confirmation bound to this plan's "
+                "source SHA-256."
+            ),
+            "include_review_actions": bool(include_review_actions),
+            "unconfirmed_actions": [
+                {
+                    "action_id": action.get("action_id"),
+                    "status": action.get("status"),
+                    "start_seconds": action.get("start_seconds"),
+                    "end_seconds": action.get("end_seconds"),
+                    "decision_source": action.get("decision_source"),
+                    "action_source_sha256": str(
+                        ((action.get("source_candidate") or {}).get("source_sha256"))
+                        or action.get("source_sha256")
+                        or ""
+                    ),
+                }
+                for action in unconfirmed
+            ],
+            "source": (plan.get("source") or {}).get("relative_path"),
+            "plan_source_sha256": _operator_plan_source_sha256(plan),
+        },
+    )
+
+
+def _production_editorial_exclusion_intervals(
+    plan: dict[str, Any],
+    include_review_actions: bool = False,
+) -> list[tuple[float, float]]:
+    """Return only source ranges of editorial actions safe to execute.
+
+    Temporal repair must not skip an in-story range merely because a detector
+    proposed an unconfirmed Mid Promo. The same production approval gate is
+    used here and by the renderer.
+    """
+    intervals = []
+    for action in (plan or {}).get("actions") or []:
+        if action.get("type") not in {"mid_promo_replace", "end_card_replace"}:
+            continue
+        if not _operator_production_approved_action(action, include_review_actions):
+            continue
+        try:
+            start = float(action.get("start_seconds", 0.0))
+            end = float(action.get("end_seconds", 0.0))
+        except (TypeError, ValueError):
+            continue
+        if 0.0 <= start < end:
+            intervals.append((start, end))
+    return intervals
+
+
+def _operator_fixed_full_cover_bbox(
+    action: dict[str, Any],
+    width: int,
+    height: int,
+    *,
+    segment: Optional[dict[str, Any]] = None,
+) -> Optional[dict[str, int]]:
+    """Return only explicit full-source-cover geometry for a fixed layer.
+
+    A detector ``bbox`` describes the evidence it found; it cannot prove that a
+    neighbouring icon, wordmark, shadow or glow is also hidden. Do not promote
+    it to a full-cover contract implicitly. Planners must provide one of the
+    explicit fields below, and every fixed renderer consumes this same resolver.
+    """
+    if not isinstance(action, dict):
+        return None
+    for container in (segment or {}, action):
+        if not isinstance(container, dict):
+            continue
+        for key in ("source_full_cover_bbox", "full_cover_bbox"):
+            candidate = container.get(key)
+            if isinstance(candidate, dict) and candidate:
+                return _clip_bbox(candidate, int(width), int(height))
+    return None
+
+
+def _operator_fixed_action_has_full_cover_contract(
+    action: dict[str, Any],
+    width: int,
+    height: int,
+) -> bool:
+    """Check that a fixed layer has a usable source-cover contract.
+
+    The renderer may draw a replacement label, but that is not proof the source
+    logo is hidden.  Production plans must carry a cover geometry equal to or
+    larger than the observed source footprint so a visual overlay cannot sit
+    beside the old icon/wordmark.
+    """
+    cover = _operator_fixed_full_cover_bbox(action, width, height)
+    source = action.get("bbox") or {}
+    if not cover or not isinstance(source, dict):
+        return False
+    try:
+        cx0, cy0 = float(cover["x"]), float(cover["y"])
+        cx1 = cx0 + float(cover["width"])
+        cy1 = cy0 + float(cover["height"])
+        sx0, sy0 = float(source["x"]), float(source["y"])
+        sx1 = sx0 + float(source["width"])
+        sy1 = sy0 + float(source["height"])
+    except (KeyError, TypeError, ValueError):
+        return False
+    return cx0 <= sx0 and cy0 <= sy0 and cx1 >= sx1 and cy1 >= sy1
+
+
+def _operator_validate_fixed_cover_actions(
+    actions: list[dict[str, Any]],
+    width: int,
+    height: int,
+) -> None:
+    """Refuse a render that would claim a fixed mark was treated without cover."""
+    invalid = []
+    for action in actions:
+        if action.get("type") != "fixed_brand_overlay":
+            continue
+        if not _operator_fixed_action_has_full_cover_contract(action, width, height):
+            invalid.append(
+                {
+                    "action_id": action.get("action_id"),
+                    "placement": action.get("placement"),
+                    "bbox": action.get("bbox"),
+                    "source_full_cover_bbox": action.get("source_full_cover_bbox"),
+                }
+            )
+    if invalid:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "stage": "replacement_render_fixed_cover_contract",
+                "error": "fixed_watermark_full_cover_geometry_required",
+                "message": (
+                    "A fixed watermark action lacks a full source-cover bbox. "
+                    "Rendering is rejected instead of drawing own branding next "
+                    "to an exposed competitor icon or wordmark."
+                ),
+                "invalid_actions": invalid,
+            },
+        )
+
+
 def _replacement_render_sync(
     req: BrandingReplacementRenderRequest
 ):
@@ -44481,6 +44797,19 @@ def _replacement_render_sync(
             continue
 
         actions.append(action)
+
+    # A Mid Promo deletes in-story source material. A detector candidate or a
+    # request to include REVIEW cards is not authorization to perform that
+    # destructive edit, so reject before writing any intermediate media.
+    _operator_validate_editorial_actions_for_render(
+        plan,
+        actions,
+        include_review_actions=bool(req.include_review_actions),
+    )
+
+    # Rendering an own label is not proof that a fixed competitor lockup is
+    # hidden. Require its measured full source-cover geometry up front.
+    _operator_validate_fixed_cover_actions(actions, width, height)
 
     top_actions = [
         action
@@ -44650,6 +44979,58 @@ def _replacement_render_sync(
                     "Moving watermark actions are present, but the dynamic "
                     "full-render pass resolved zero census tracks. Rendering "
                     "was stopped instead of silently omitting the watermark."
+                ),
+            },
+        )
+
+    missing_top_cover_receipts = [
+        action.get("action_id")
+        for action in top_actions
+        if not any(
+            str(receipt.get("action_id") or "")
+            == str(action.get("action_id") or "")
+            and int(receipt.get("frames_rendered") or 0) > 0
+            and bool(receipt.get("source_full_cover_bbox_used"))
+            for receipt in (visual_base_report.get("top_full_cover_receipts") or [])
+        )
+    ]
+    if missing_top_cover_receipts:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "stage": "replacement_render",
+                "error": "top_fixed_full_cover_receipt_missing",
+                "action_ids": missing_top_cover_receipts,
+                "message": (
+                    "A top fixed watermark action had no full-source-cover render "
+                    "receipt. Rendering is rejected rather than claiming the "
+                    "competitor lockup was hidden."
+                ),
+            },
+        )
+
+    missing_bottom_cover_receipts = [
+        action.get("action_id")
+        for action in bottom_actions
+        if not any(
+            str(receipt.get("action_id") or "")
+            == str(action.get("action_id") or "")
+            and int(receipt.get("frames_rendered") or 0) > 0
+            and bool(receipt.get("source_full_cover_bbox_used"))
+            for receipt in (visual_base_report.get("bottom_full_cover_receipts") or [])
+        )
+    ]
+    if missing_bottom_cover_receipts:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "stage": "replacement_render",
+                "error": "bottom_fixed_full_cover_receipt_missing",
+                "action_ids": missing_bottom_cover_receipts,
+                "message": (
+                    "A bottom fixed watermark action had no full-source-cover render "
+                    "receipt. Rendering is rejected rather than claiming the "
+                    "competitor lockup was hidden."
                 ),
             },
         )
@@ -45403,6 +45784,11 @@ class BrandingReplacementRenderRequest(BaseModel):
     mid_promo_transition_score_multiplier: float = 1.65
     mid_promo_transition_max_extra_frames: int = 8
 
+    # A reviewed request can lock the terminal cut to its manual semantic onset
+    # by passing a zero guard; the default keeps the ordinary safety pre-roll.
+    end_card_boundary_guard_frames: int = 12
+    end_card_boundary_scan_interval_seconds: float = 0.05
+
     # Persistent and diagonal source marks are blurred in place, never
     # replaced with own-brand text, imagery or an opaque plate.
     diagonal_brand_cover_enabled: bool = True
@@ -45858,8 +46244,6 @@ def _load_diagonal_brand_cover_geometry(
                 float(getattr(req, "persistent_watermark_cover_expand_ratio", 1.12)),
             )
             for raw in explicit_anchors:
-                if str(raw.get("kind") or "fixed_watermark").lower() != "fixed_watermark":
-                    continue
                 try:
                     x = float(raw["x"])
                     y = float(raw["y"])
@@ -45879,7 +46263,6 @@ def _load_diagonal_brand_cover_geometry(
                 points.append(
                     {
                         "id": str(raw.get("id") or f"anchor-{len(points) + 1:02d}"),
-                        "treatment": str(raw.get("treatment") or "inpaint"),
                         "center": {
                             "x": int(round((x + box_w / 2.0) * width)),
                             "y": int(round((y + box_h / 2.0) * height)),
@@ -46476,7 +46859,6 @@ def _apply_diagonal_brand_cover(
         return frame
 
     out = frame.copy()
-    frame_height, frame_width = out.shape[:2]
 
     for point in (
         geometry.get(
@@ -46509,33 +46891,20 @@ def _apply_diagonal_brand_cover(
             "width": point_width,
             "height": point_height,
         }
-        # Source-specific anchors are not all brand marks.  The countdown /
-        # offer panel and the large translucent centre wordmark must be
-        # removed, not replaced with a generic opaque banner.  Inpaint each
-        # region from neighbouring scene pixels to avoid the previous giant
-        # gray/black rectangle artifact.  A logo replacement can be enabled
-        # explicitly per anchor via ``treatment=own_brand``.
-        treatment = str(point.get("treatment") or "inpaint").lower()
-        if treatment == "own_brand":
-            assets = profile.get("assets") or {}
-            logo = _load_bgr_asset(
-                assets.get("logo_image_relative_path")
-                or assets.get("icon_image_relative_path")
-            )
-            out = _draw_brand_banner(
-                out,
-                point_bbox,
-                profile.get("product_name") or profile.get("brand_name") or "",
-                logo_image=logo,
-                min_height=point_height,
-            )
-        else:
-            out = _operator_inpaint_bbox_fast(
-                out,
-                _expand_bbox_ratio(point_bbox, frame_width, frame_height, 0.04, 0.06),
-                padding=4,
-                radius=5.0,
-            )
+        # Persistent anchors are fixed competitor product UI. Replace them
+        # deterministically with the own brand; only moving tracks use repair.
+        assets = profile.get("assets") or {}
+        logo = _load_bgr_asset(
+            assets.get("logo_image_relative_path")
+            or assets.get("icon_image_relative_path")
+        )
+        out = _draw_brand_banner(
+            out,
+            point_bbox,
+            profile.get("product_name") or profile.get("brand_name") or "",
+            logo_image=logo,
+            min_height=point_height,
+        )
 
     return out
 
@@ -46545,90 +46914,63 @@ def _operator_bottom_action_bbox_at_time(
     action,
     t,
     duration,
+    width=0,
+    height=0,
 ):
-    """Return the active bottom bbox at time t, or None when inactive."""
-    segments = (
-        (action or {}).get(
-            "active_segments"
-        )
-        or []
-    )
+    """Return active *explicit full-cover* geometry for a bottom action.
+
+    It is deliberately not a generic bbox helper: using a detector bbox here
+    made bottom validation and rasterization disagree, leaving source lockup
+    pixels exposed beside an own-brand banner.
+    """
+    segments = (action or {}).get("active_segments") or []
 
     if segments:
         for segment in segments:
             try:
-                start = float(
-                    segment.get(
-                        "start_seconds"
-                    )
-                    or 0.0
-                )
-                end = float(
-                    segment.get(
-                        "end_seconds"
-                    )
-                    or start
-                )
+                start = float(segment.get("start_seconds") or 0.0)
+                end = float(segment.get("end_seconds") or start)
             except Exception:
                 continue
-
-            if (
-                t >= start - 1e-3
-                and t <= end + 1e-3
-            ):
-                return (
-                    segment.get(
-                        "bbox"
-                    )
-                    or (action or {}).get(
-                        "bbox"
-                    )
+            if t >= start - 1e-3 and t <= end + 1e-3:
+                return _operator_fixed_full_cover_bbox(
+                    action,
+                    int(width),
+                    int(height),
+                    segment=segment,
                 )
         return None
 
     try:
-        start = float(
-            (action or {}).get(
-                "start_seconds"
-            )
-            or 0.0
-        )
+        start = float((action or {}).get("start_seconds") or 0.0)
     except Exception:
         start = 0.0
-
     try:
-        end = float(
-            (action or {}).get(
-                "end_seconds"
-            )
-            or duration
-            or 0.0
-        )
+        end = float((action or {}).get("end_seconds") or duration or 0.0)
     except Exception:
-        end = float(
-            duration
-            or 0.0
-        )
-
+        end = float(duration or 0.0)
     if end <= 0:
-        end = float(
-            duration
-            or 0.0
-        )
-
-    if (
-        t < start - 1e-3
-        or (
-            end > 0
-            and t > end + 1e-3
-        )
-    ):
+        end = float(duration or 0.0)
+    if t < start - 1e-3 or (end > 0 and t > end + 1e-3):
         return None
 
-    return (
-        (action or {}).get(
-            "bbox"
-        )
+    return _operator_fixed_full_cover_bbox(action, int(width), int(height))
+
+
+def _operator_bottom_action_cover_receipt(
+    action,
+    t,
+    duration,
+    width,
+    height,
+):
+    """Resolve the exact bottom cover used by the renderer for audit/QC."""
+    return _operator_bottom_action_bbox_at_time(
+        action,
+        t,
+        duration,
+        width,
+        height,
     )
 
 
@@ -46879,6 +47221,7 @@ def _render_visual_base_full(
     top_icon_asset_frames = 0
     top_product_text_frames = 0
     top_icon_treatments = {}
+    top_full_cover_receipts = {}
     top_product_name = str(
         profile.get("product_name") or ""
     ).strip()
@@ -46946,6 +47289,7 @@ def _render_visual_base_full(
 
     bottom_brand_cover_frames = 0
     bottom_brand_cover_applications = 0
+    bottom_full_cover_receipts = {}
 
     for track in dynamic_tracks:
         source = str(
@@ -47084,6 +47428,22 @@ def _render_visual_base_full(
                     ):
                         top_icon_asset_frames += 1
 
+                    for item in applied:
+                        action_id = str(item.get("action_id") or "unknown")
+                        receipt = top_full_cover_receipts.setdefault(
+                            action_id,
+                            {
+                                "action_id": action_id,
+                                "frames_rendered": 0,
+                                "source_full_cover_bbox_used": None,
+                            },
+                        )
+                        receipt["frames_rendered"] += 1
+                        if item.get("source_cover_bbox"):
+                            receipt["source_full_cover_bbox_used"] = item.get(
+                                "source_cover_bbox"
+                            )
+
                     if (
                         top_product_name
                         and str(
@@ -47151,6 +47511,8 @@ def _render_visual_base_full(
                             bottom_action,
                             t,
                             duration,
+                            width,
+                            height,
                         )
                     )
 
@@ -47177,6 +47539,17 @@ def _render_visual_base_full(
                         bottom_bbox,
                         profile,
                     )
+                    action_id = str(bottom_action.get("action_id") or "unknown")
+                    receipt = bottom_full_cover_receipts.setdefault(
+                        action_id,
+                        {
+                            "action_id": action_id,
+                            "frames_rendered": 0,
+                            "source_full_cover_bbox_used": bottom_bbox,
+                        },
+                    )
+                    receipt["frames_rendered"] += 1
+                    receipt["source_full_cover_bbox_used"] = bottom_bbox
                     bottom_applied += 1
                     bottom_regions.append(bottom_bbox)
 
@@ -47291,6 +47664,7 @@ def _render_visual_base_full(
         "top_icon_treatments": (
             top_icon_treatments
         ),
+        "top_full_cover_receipts": list(top_full_cover_receipts.values()),
         "top_product_name": (
             top_product_name
         ),
@@ -47362,6 +47736,7 @@ def _render_visual_base_full(
         "bottom_brand_cover_applications": (
             bottom_brand_cover_applications
         ),
+        "bottom_full_cover_receipts": list(bottom_full_cover_receipts.values()),
         "bottom_brand_treatment": "opaque_own_brand_banner",
         "diagonal_brand_cover": (
             diagonal_geometry
@@ -47955,6 +48330,11 @@ class BrandingReplacementRenderRequest(BaseModel):
     mid_promo_transition_scan_seconds: float = 0.30
     mid_promo_transition_score_multiplier: float = 1.65
     mid_promo_transition_max_extra_frames: int = 8
+
+    # A reviewed request can lock the terminal cut to its manual semantic onset
+    # by passing a zero guard; the default keeps the ordinary safety pre-roll.
+    end_card_boundary_guard_frames: int = 12
+    end_card_boundary_scan_interval_seconds: float = 0.05
 
     diagonal_brand_cover_enabled: bool = False
     diagonal_brand_cover_text: Optional[str] = None
@@ -48707,6 +49087,11 @@ class BrandingReplacementRenderRequest(BaseModel):
     mid_promo_transition_score_multiplier: float = 1.65
     mid_promo_transition_max_extra_frames: int = 8
 
+    # A reviewed request can lock the terminal cut to its manual semantic onset
+    # by passing a zero guard; the default keeps the ordinary safety pre-roll.
+    end_card_boundary_guard_frames: int = 12
+    end_card_boundary_scan_interval_seconds: float = 0.05
+
     # Moving/transient competitor watermark cover. This is distinct from the
     # faint diagonal tiled watermark, which remains separately controlled.
     dynamic_brand_cover_enabled: bool = False
@@ -48736,6 +49121,9 @@ class BrandingReplacementRenderRequest(BaseModel):
     dynamic_watermark_temporal_recovery_output_dir_relative_path: Optional[str] = None
     dynamic_watermark_temporal_recovery_strength: float = 1.0
     dynamic_watermark_temporal_recovery_keep_intermediate: bool = False
+    # Source intervals replaced by editorial media are excluded from every
+    # watermark treatment. This avoids repairing frames that will be cut.
+    processing_excluded_intervals: list[tuple[float, float]] = Field(default_factory=list)
 
     # Persistent/diagonal competitor watermark cover. This is enabled by
     # default for replacement renders: a source-specific watermark profile is
@@ -49940,7 +50328,19 @@ def _apply_top_brand_composition_render(
         # never rendered (or receipted) the configured icon asset.  That made a
         # technically valid MP4 fail the business QC as "competitor-brand
         # treatment was not actually rendered".
-        text_slot = action.get("_operator_canonical_text_slot")
+        # A reviewed action can distinguish the source watermark footprint
+        # from the desired own-brand layout.  The earlier renderer used the
+        # source wordmark box as both.  For a left-side lockup such as
+        # ``[source icon][source wordmark]``, it consequently created the own
+        # icon *after* the text and left the original icon exposed.  Keep the
+        # own presentation slots explicit when a visual QC pass has calibrated
+        # them; otherwise retain the canonical fallback for ordinary plans.
+        reviewed_text_slot = action.get("own_text_bbox")
+        text_slot = (
+            _clip_bbox(reviewed_text_slot, width, height)
+            if isinstance(reviewed_text_slot, dict)
+            else action.get("_operator_canonical_text_slot")
+        )
         if not text_slot:
             text_slot = _canonical_top_text_slot(action, width, height, req)
             if text_slot:
@@ -49950,25 +50350,47 @@ def _apply_top_brand_composition_render(
             # zero-frame QC receipt will safely reject it.
             continue
 
-        icon_slot = action.get("_operator_canonical_icon_slot")
-        if not icon_slot:
-            icon_slot = _canonical_top_icon_slot(
-                text_slot,
-                placement,
-                width,
-                height,
-                req,
+        top_brand_mode = str(
+            getattr(req, "top_brand_mode", "auto") or "auto"
+        ).lower()
+        render_icon = top_brand_mode not in {"text_only"}
+        icon_slot = None
+        if render_icon:
+            reviewed_icon_slot = action.get("own_icon_bbox") or action.get("source_icon_bbox")
+            icon_slot = (
+                _clip_bbox(reviewed_icon_slot, width, height)
+                if isinstance(reviewed_icon_slot, dict)
+                else action.get("_operator_canonical_icon_slot")
             )
-            if icon_slot:
-                action["_operator_canonical_icon_slot"] = icon_slot
-        if not icon_slot:
-            continue
+            if not icon_slot:
+                icon_slot = _canonical_top_icon_slot(
+                    text_slot,
+                    placement,
+                    width,
+                    height,
+                    req,
+                )
+                if icon_slot:
+                    action["_operator_canonical_icon_slot"] = icon_slot
+            if not icon_slot:
+                continue
 
-        # Reconstruct only the observed source wordmark footprint.  The icon
-        # gets a deliberately opaque own-brand plate below, which guarantees the
-        # competitor mark cannot bleed through transparent artwork.
+        # The full cover geometry is the visual contract for a fixed source
+        # lockup. Resolve and apply it before any own-brand drawing; never use a
+        # text-only detector bbox as a surrogate for an icon + wordmark lockup.
+        active_segment = _active_fixed_segment(
+            action.get("active_segments") or [],
+            float(t),
+        )
+        source_cover_bbox = _operator_fixed_full_cover_bbox(
+            action,
+            int(width),
+            int(height),
+            segment=active_segment,
+        )
+        source_cleanup_bbox = source_cover_bbox or base_bbox
         cleanup_bbox = _expand_bbox_ratio(
-            base_bbox,
+            source_cleanup_bbox,
             width,
             height,
             float(getattr(req, "top_text_cleanup_expand_x_ratio", 0.10)),
@@ -49980,34 +50402,44 @@ def _apply_top_brand_composition_render(
             padding=2,
             radius=3.0,
         )
-
-        icon_cover_bbox = _strong_icon_cover_bbox(
-            icon_slot,
-            width,
-            height,
-            req,
-        )
-        if bool(getattr(req, "top_icon_strong_cover_enabled", True)):
+        if source_cover_bbox:
             processed = _draw_opaque_icon_plate(
                 processed,
-                icon_cover_bbox,
-                float(getattr(req, "top_icon_cover_plate_alpha", 1.0)),
-                float(getattr(req, "top_icon_cover_plate_padding_ratio", 0.08)),
+                source_cover_bbox,
+                1.0,
+                0.0,
             )
+        icon_cover_bbox = None
+        icon_treatment = None
+        if render_icon:
+            icon_cover_bbox = _strong_icon_cover_bbox(
+                icon_slot,
+                width,
+                height,
+                req,
+            )
+            if bool(getattr(req, "top_icon_strong_cover_enabled", True)):
+                processed = _draw_opaque_icon_plate(
+                    processed,
+                    icon_cover_bbox,
+                    float(getattr(req, "top_icon_cover_plate_alpha", 1.0)),
+                    float(getattr(req, "top_icon_cover_plate_padding_ratio", 0.08)),
+                )
 
-        processed, icon_treatment = _draw_icon_into_canonical_slot(
-            processed,
-            icon_slot,
-            profile,
-            req,
-        )
-        processed = _draw_canonical_brand_text(
-            processed,
-            text_slot,
-            profile,
-            placement,
-            req,
-        )
+            processed, icon_treatment = _draw_icon_into_canonical_slot(
+                processed,
+                icon_slot,
+                profile,
+                req,
+            )
+        if top_brand_mode != "logo_only":
+            processed = _draw_canonical_brand_text(
+                processed,
+                text_slot,
+                profile,
+                placement,
+                req,
+            )
 
         applied.append(
             {
@@ -50027,6 +50459,7 @@ def _apply_top_brand_composition_render(
                 "canonical_text_slot": text_slot,
                 "icon_bbox": icon_slot,
                 "icon_cover_bbox": icon_cover_bbox,
+                "source_cover_bbox": source_cover_bbox,
                 "icon_treatment": icon_treatment,
                 "treatment": "source_cleanup_then_own_brand",
                 "canonical_layout": True,
@@ -50060,12 +50493,9 @@ def _replacement_render_sync(
     # every source, including clean sources with zero tracks. That necessarily
     # produced an empty residual QA report, which was then misclassified as a
     # hard repair failure and blocked the entire edit.
-    # Recompute from the authoritative census. Cached plan summaries created
-    # before the confidence gate may contain false dynamic-track counts.
-    preflight_dynamic_tracks = 0
-    dynamic_candidate_declared = any(
-        str(anchor.get("kind") or "").lower() == "dynamic_watermark_candidate"
-        for anchor in (plan.get("persistent_watermark_anchor_boxes") or [])
+    preflight_dynamic_tracks = max(
+        0,
+        int(plan_summary.get("operator_dynamic_brand_expected_track_count") or 0),
     )
     if preflight_dynamic_tracks <= 0:
         preflight_census_rel = str(
@@ -50087,16 +50517,7 @@ def _replacement_render_sync(
                 )
                 strict = preflight_census.get("verified_dynamic_identity") or {}
                 if bool(strict.get("enabled")):
-                    preflight_dynamic_tracks = sum(
-                        1
-                        for track in (strict.get("tracks") or [])
-                        if (
-                            (lambda scores: bool(scores) and sum(scores) / len(scores) >= 0.62)([
-                                float(point.get("template_score") or point.get("confidence") or 0.0)
-                                for point in (track.get("points") or track.get("waypoints") or [])
-                            ])
-                        )
-                    )
+                    preflight_dynamic_tracks = len(strict.get("tracks") or [])
         except Exception:
             # The later normal renderer preflight still handles unreadable
             # reports. Do not turn optional temporal diagnostics into a false
@@ -50116,9 +50537,20 @@ def _replacement_render_sync(
                 authoritative_census_rel,
                 "replacement_render_authoritative_temporal_tracks",
             )
-            # API callers may provide either the router report or the census
-            # report directly.  Do not erase the latter while resolving it.
-            if not (authoritative_router.get("verified_dynamic_identity") or {}).get("tracks"):
+            # API callers may provide either the legacy router report, a
+            # strict-census report, or the reviewed full-frame census directly.
+            # The reviewed report stores its human-validated trajectories in
+            # ``detector.tracks`` (rather than ``verified_dynamic_identity``).
+            # Do not erase that direct report and force a second detector pass:
+            # repair must consume exactly the reviewed track IDs, windows and
+            # waypoints supplied by the operator.
+            has_strict_census_tracks = bool(
+                (authoritative_router.get("verified_dynamic_identity") or {}).get("tracks")
+            )
+            has_reviewed_fullframe_tracks = bool(
+                (authoritative_router.get("detector") or {}).get("tracks")
+            )
+            if not has_strict_census_tracks and not has_reviewed_fullframe_tracks:
                 authoritative_census_rel = str(
                     ((authoritative_router.get("evidence_reports") or {}).get("census") or "")
                 ).strip()
@@ -50127,11 +50559,18 @@ def _replacement_render_sync(
     authoritative_temporal_tracks = _operator_temporal_tracks_from_census(
         authoritative_census_rel
     )
+    # Editorial source ranges are removed before delivery. Carry those exact
+    # approved intervals into dynamic repair so we neither mask nor QA frames
+    # that are replaced by a mid-promo or an own end-card.
+    editorial_processing_exclusions = _production_editorial_exclusion_intervals(
+        plan,
+        include_review_actions=bool(getattr(req, "include_review_actions", False)),
+    )
 
     if (
         bool(getattr(req, "dynamic_watermark_temporal_recovery_enabled", False))
         and original_source_rel
-        and (preflight_dynamic_tracks > 0 or dynamic_candidate_declared)
+        and preflight_dynamic_tracks > 0
     ):
         # Run the dynamic-watermark temporal stage before the canonical
         # fixed/top/bottom/diagonal compositor. The compositor then sees one
@@ -50242,6 +50681,11 @@ def _replacement_render_sync(
                 source_icon_relative_path=source_identity.get("icon_relative_path"),
                 source_logo_relative_path=source_identity.get("logo_relative_path"),
                 recovery_strength=float(getattr(req, "dynamic_watermark_temporal_recovery_strength", 1.0)),
+                # Track-bounded bbox support is the production default. The
+                # reviewed template still provides identity/QA evidence, but a
+                # glyph-only mask cannot erase a translucent watermark body.
+                repair_mask_mode="bbox",
+                repair_mask_dilation=1,
                 # ProPainter is optional on the CPU/MX250 deployment.  The
                 # local trajectory clean-plate backend remains explicit in
                 # the report and is accepted only when residual QA passes;
@@ -50250,14 +50694,8 @@ def _replacement_render_sync(
                 in {"1", "true", "yes", "on"},
                 verified_tracks=authoritative_temporal_tracks,
                 verified_tracks_source=authoritative_census_rel or None,
-                # Keep temporal-repair exclusions identical to the downstream
-                # editorial execution route. Unconfirmed REVIEW actions are
-                # skipped by unattended renders and must not skip watermark
-                # cleanup in source pixels that remain in the final video.
-                qa_excluded_intervals=_production_editorial_exclusion_intervals(
-                    plan,
-                    include_review_actions=bool(getattr(req, "include_review_actions", False)),
-                ),
+                qa_excluded_intervals=editorial_processing_exclusions,
+                processing_excluded_intervals=editorial_processing_exclusions,
                 output_dir_relative_path=getattr(req, "dynamic_watermark_temporal_recovery_output_dir_relative_path", None),
             )
         )
@@ -50324,7 +50762,10 @@ def _replacement_render_sync(
                 "The original source is retained for the normal fixed-layer and editorial render.",
             ],
         }
-    expected_dynamic_tracks = int(preflight_dynamic_tracks)
+    expected_dynamic_tracks = max(
+        0,
+        int(plan_summary.get("operator_dynamic_brand_expected_track_count") or 0),
+    )
     if temporal_handoff and temporal_handoff.get("status") not in {"failed", "encode_failed"}:
         # Dynamic source watermark was already handled by the temporal stage.
         expected_dynamic_tracks = 0
@@ -50357,16 +50798,7 @@ def _replacement_render_sync(
             )
             strict = census.get("verified_dynamic_identity") or {}
             if bool(strict.get("enabled")):
-                expected_dynamic_tracks = sum(
-                    1
-                    for track in (strict.get("tracks") or [])
-                    if (
-                        (lambda scores: bool(scores) and sum(scores) / len(scores) >= 0.62)([
-                            float(point.get("template_score") or point.get("confidence") or 0.0)
-                            for point in (track.get("points") or track.get("waypoints") or [])
-                        ])
-                    )
-                )
+                expected_dynamic_tracks = len(strict.get("tracks") or [])
         except Exception:
             pass
 
@@ -50398,7 +50830,7 @@ def _replacement_render_sync(
                 (layout_payload.get("sources") or {}).get(source_rel)
                 or {}
             )
-            anchors = list(source_layout.get("anchors") or [])
+            anchors = source_layout.get("anchors") or []
             if (
                 anchors
                 and bool(getattr(req, "persistent_watermark_auto_from_source_layout", True))
@@ -50467,6 +50899,13 @@ def _replacement_render_sync(
         )
     )
 
+    result.setdefault("execution_order", {})["actual"] = (
+        "diagonal_filter_then_editorial_trim_then_fixed_and_dynamic_watermark_treatment_then_final_concat"
+    )
+    result["execution_order"]["editorial_processing_excluded_intervals"] = [
+        {"start_seconds": start, "end_seconds": end}
+        for start, end in editorial_processing_exclusions
+    ]
     visual = result.get("visual_base") or {}
     detected = int(visual.get("dynamic_brand_actions_detected") or 0)
     rendered = int(visual.get("dynamic_brand_actions_rendered") or 0)
@@ -51379,8 +51818,8 @@ def _production_verified_dynamic_track_count(plan: dict[str, Any]) -> int:
     """Return the strict dynamic-track count without treating broad candidates as marks."""
     summary = plan.get("summary") or {}
     count = max(0, int(summary.get("operator_dynamic_brand_expected_track_count") or 0))
-    # Do not trust the cached derived count blindly; old plans counted broad
-    # low-confidence template matches as dynamic watermarks.
+    if count > 0:
+        return count
 
     router_rel = str(((plan.get("source") or {}).get("router_report_relative_path") or "")).strip()
     try:
@@ -51391,15 +51830,7 @@ def _production_verified_dynamic_track_count(plan: dict[str, Any]) -> int:
             _, census = _read_json_workspace(router_rel, "production_execution_route")
             strict = census.get("verified_dynamic_identity") or {}
             if bool(strict.get("enabled")):
-                valid = []
-                for track in strict.get("tracks") or []:
-                    scores = [
-                        float(point.get("template_score") or point.get("confidence") or 0.0)
-                        for point in (track.get("points") or track.get("waypoints") or [])
-                    ]
-                    if scores and sum(scores) / len(scores) >= 0.62:
-                        valid.append(track)
-                return len(valid)
+                return len(strict.get("tracks") or [])
     except Exception:
         # A missing optional diagnostic must not turn an otherwise valid edit
         # into a false dynamic-watermark classification.
@@ -51438,35 +51869,13 @@ def _production_detected_watermark_present(plan: dict[str, Any]) -> bool:
         return False
 
 
-def _production_editorial_exclusion_intervals(
-    plan: dict[str, Any],
-    include_review_actions: bool = False,
-) -> list[tuple[float, float]]:
-    """Return only editorial intervals that will actually be rendered."""
-    intervals = []
-    for action in (plan or {}).get("actions") or []:
-        if action.get("type") not in {"mid_promo_replace", "end_card_replace"}:
-            continue
-        status = str(action.get("status") or "").strip().upper()
-        if status == "REVIEW" and not bool(include_review_actions):
-            continue
-        try:
-            start = float(action.get("start_seconds", 0.0))
-            end = float(action.get("end_seconds", 0.0))
-        except (TypeError, ValueError):
-            continue
-        if 0.0 <= start < end:
-            intervals.append((start, end))
-    return intervals
-
-
 def _production_execution_route(
     plan: dict[str, Any],
     verified_dynamic_track_count: int = 0,
     include_review_actions: bool = True,
     detected_watermark_present: bool = False,
 ) -> dict[str, Any]:
-    """Build the single production route: watermark classification, then editorial actions."""
+    """Build the production route: classify, trim editorial spans, then treat retained frames."""
     accepted_actions = [
         action
         for action in (plan.get("actions") or [])
@@ -51503,26 +51912,9 @@ def _production_execution_route(
         if action.get("type") == "end_card_replace"
     ]
 
-    # Explicit source-layout anchors are authoritative fixed-watermark
-    # evidence even when the router report has no OCR layer (for example a
-    # persistent ReelShort logo/offer panel that the generic census cannot
-    # classify).  Without this, production silently selected the
-    # ``dynamic_only`` route and never ran the fixed compositor.
-    fixed_present = bool(fixed_actions) or any(
-        str(anchor.get("kind") or "fixed_watermark").lower() == "fixed_watermark"
-        for anchor in (plan.get("persistent_watermark_anchor_boxes") or [])
-    )
-    dynamic_candidate_present = any(
-        str(anchor.get("kind") or "").lower() == "dynamic_watermark_candidate"
-        for anchor in (plan.get("persistent_watermark_anchor_boxes") or [])
-    )
+    fixed_present = bool(fixed_actions)
     dynamic_track_count = max(0, int(verified_dynamic_track_count or 0))
-    # A declared dynamic candidate must keep the temporal detector enabled so
-    # it can discover the actual icon/logo/text trajectory. Previously the
-    # route saw zero cached tracks, classified the source as fixed-only, and
-    # rewrote the render request with temporal recovery disabled before the
-    # automatic detector ever ran.
-    dynamic_present = dynamic_track_count > 0 or dynamic_candidate_present
+    dynamic_present = dynamic_track_count > 0
     watermark_present = bool(detected_watermark_present) or fixed_present or dynamic_present
     if fixed_present and dynamic_present:
         classification = "fixed_and_dynamic"
@@ -51538,7 +51930,7 @@ def _production_execution_route(
     classification_required = classification == "unclassified"
 
     return {
-        "version": "watermark_then_editorial_v1",
+        "version": "editorial_then_watermark_v2",
         "watermark": {
             "present": watermark_present,
             "classification": classification,
@@ -51563,6 +51955,7 @@ def _production_execution_route(
             "own_brand_overlay_for_dynamic_watermarks": False,
         },
         "editorial": {
+            "execution_order": "identify_and_replace_mid_promo_and_end_card_before_fixed_and_dynamic_watermark_treatment",
             "mid_promo_present": bool(mid_promo_actions),
             "mid_promo_action_count": len(mid_promo_actions),
             "mid_promo_strategy": "replace" if mid_promo_actions else "skip",
@@ -51571,6 +51964,7 @@ def _production_execution_route(
             "end_card_strategy": "replace" if end_card_actions else "append_own",
         },
         "render": {
+            "execution_order": "diagonal_filter_then_editorial_trim_then_fixed_and_dynamic_watermark_treatment_then_final_concat",
             # No fixed watermark means no fixed-layer compositor work. Dynamic
             # repair is performed before this compositor from strict tracks.
             "watermark_treatment_mode": "rebrand_fixed_clean_dynamic" if fixed_present else "skip_no_fixed_watermark",
@@ -51594,6 +51988,85 @@ def _production_execution_route(
     }
 
 
+def _operator_same_source_diagonal_profile(video_entry, metadata):
+    """Return whether an exact source-specific diagonal profile is reusable.
+
+    The profile registry stores geometry learned from a reviewed source.  It is
+    intentionally narrow: source stem and video shape/duration must match, and
+    the acquisition identity must match the registered brand.  A same-brand
+    video with a different filename or layout therefore still goes through the
+    live detector and cannot be discarded from a profile alone.
+    """
+    entry = video_entry or {}
+    metadata = metadata or {}
+    source_stem = Path(str(entry.get("relative_path") or "")).stem
+    if not source_stem:
+        return False
+
+    try:
+        source_width = int(metadata.get("width") or 0)
+        source_height = int(metadata.get("height") or 0)
+        source_duration = float(metadata.get("duration_seconds") or 0.0)
+        source_frames = int(metadata.get("frame_count") or 0)
+    except (TypeError, ValueError):
+        return False
+    if source_width <= 0 or source_height <= 0 or source_duration <= 0.0:
+        return False
+
+    identity = _norm_brand_name(
+        entry.get("product_name")
+        or entry.get("app_title")
+        or entry.get("brand_name")
+    )
+    try:
+        registry = _load_watermark_registry()
+    except Exception:
+        return False
+
+    for profile in registry.get("profiles") or []:
+        if (
+            str(profile.get("handler") or "") != "diagonal_tiled_grid"
+            or str(profile.get("status") or "") != "validated_on_source"
+        ):
+            continue
+        profile_brand = _norm_brand_name(
+            profile.get("brand_name") or profile.get("brand_key")
+        )
+        if not profile_brand or not identity or profile_brand not in identity:
+            continue
+
+        profile_source = str(
+            ((profile.get("source") or {}).get("relative_path") or "")
+        )
+        if Path(profile_source).stem != source_stem:
+            continue
+
+        profile_video = (profile.get("source") or {}).get("video") or {}
+        try:
+            profile_width = int(profile_video.get("width") or 0)
+            profile_height = int(profile_video.get("height") or 0)
+            profile_duration = float(profile_video.get("duration_seconds") or 0.0)
+            profile_frames = int(profile_video.get("frame_count") or 0)
+        except (TypeError, ValueError):
+            continue
+        if (profile_width, profile_height) != (source_width, source_height):
+            continue
+        if abs(profile_duration - source_duration) > 0.25:
+            continue
+        if profile_frames and source_frames and abs(profile_frames - source_frames) > 2:
+            continue
+        geometry = profile.get("geometry") or {}
+        if not (
+            geometry.get("origin_normalized")
+            and len(geometry.get("basis_vectors_normalized") or []) >= 2
+            and geometry.get("canonical_tile_normalized")
+        ):
+            continue
+        return True
+
+    return False
+
+
 def _operator_diagonal_tiled_watermark_screen(video_entry):
     """Fast pre-edit gate for repeated diagonal/tiled source watermarks.
 
@@ -51615,6 +52088,15 @@ def _operator_diagonal_tiled_watermark_screen(video_entry):
         duration = float(metadata.get("duration_seconds") or 0.0)
         if width <= 0 or height <= 0:
             return {"detected": False, "status": "screen_unavailable", "relative_path": relative_path}
+
+        # A calibrated profile is an evidence-backed source fingerprint, not a
+        # generic brand rule. Re-acquired copies may live under a different
+        # raw/<run-minute>/ directory, so the gate must consult the validated
+        # profile after matching the source identity and video metadata.
+        validated_profile_match = _operator_same_source_diagonal_profile(
+            video_entry,
+            metadata,
+        )
 
         max_frames = 120
         interval = max(0.50, duration / float(max_frames)) if duration > 0 else 0.75
@@ -51815,7 +52297,8 @@ def _operator_diagonal_tiled_watermark_screen(video_entry):
             best = dict(best)
             best["qualifies_as_repeated_grid"] = False
             best["rejection_reason"] = "ambiguous_opposite_diagonal_angles_likely_ui_chrome"
-        detected = bool(best.get("qualifies_as_repeated_grid"))
+        realtime_detected = bool(best.get("qualifies_as_repeated_grid"))
+        detected = bool(realtime_detected or validated_profile_match)
         timestamp = _app_now().strftime("%Y-%m-%d_%H%M%S")
         out_dir = WORKSPACE / "review" / "diagonal_watermark_screen" / timestamp / video_path.stem
         out_dir.mkdir(parents=True, exist_ok=True)
@@ -51832,6 +52315,17 @@ def _operator_diagonal_tiled_watermark_screen(video_entry):
             },
             "summary": {
                 "detected": detected,
+                "realtime_detected": realtime_detected,
+                "validated_same_source_profile": bool(validated_profile_match),
+                "detection_source": (
+                    "realtime_detector_and_validated_same_source_profile"
+                    if realtime_detected and validated_profile_match
+                    else "realtime_detector"
+                    if realtime_detected
+                    else "validated_same_source_profile"
+                    if validated_profile_match
+                    else "none"
+                ),
                 "best_angle_degrees": best.get("angle_degrees"),
                 "persistent_tile_count": int(best.get("persistent_tile_count") or 0),
                 "horizontal_span_ratio": float(best.get("horizontal_span_ratio") or 0.0),
@@ -51851,7 +52345,11 @@ def _operator_diagonal_tiled_watermark_screen(video_entry):
                 "simultaneous_multi_tile_ratio": float(
                     best.get("simultaneous_multi_tile_ratio") or 0.0
                 ),
-                "rejection_reason": best.get("rejection_reason"),
+                "rejection_reason": (
+                    "validated_same_source_profile"
+                    if validated_profile_match and not realtime_detected
+                    else best.get("rejection_reason")
+                ),
             },
             "angle_reports": angle_reports,
             "policy": {
@@ -51989,10 +52487,19 @@ def _validate_image_asset(
         return result
 
     h, w = image.shape[:2]
+    # A readable image can still be an uninitialized placeholder (for example
+    # a uniform mid-grey PNG). Treating it as a valid logo made a fixed cover
+    # look successful while drawing no recognizable own brand. This local check
+    # applies to every profile and does not rely on source-video geometry.
+    color = image[:, :, :3] if len(image.shape) == 3 else image
+    spatial_stddev = float(np.std(color))
+    flat_color = color.reshape(-1, color.shape[-1] if len(color.shape) == 3 else 1)
+    unique_color_count = int(len(np.unique(flat_color, axis=0)))
+    visually_empty = spatial_stddev < 1.0 or unique_color_count <= 1
 
     result.update(
         {
-            "valid": True,
+            "valid": not visually_empty,
             "width": int(w),
             "height": int(h),
             "channels": (
@@ -52004,8 +52511,17 @@ def _validate_image_asset(
                 len(image.shape) == 3
                 and image.shape[2] == 4
             ),
+            "visual_integrity": {
+                "valid": not visually_empty,
+                "spatial_stddev": round(spatial_stddev, 3),
+                "unique_color_count": unique_color_count,
+                "error": "image_visual_content_blank" if visually_empty else None,
+            },
         }
     )
+
+    if visually_empty:
+        result["error"] = "image_visual_content_blank"
 
     return result
 
@@ -52994,21 +53510,6 @@ def _production_candidate_render_sync(
         "actions"
     ) or []
 
-    # Load exact-source fixed watermark anchors before building the execution
-    # route.  The generic router may report only strict moving tracks while
-    # persistent corner/centre marks remain visible throughout the story.
-    if not plan.get("persistent_watermark_anchor_boxes"):
-        try:
-            layout_payload = json.loads(
-                (WORKSPACE / "config" / "persistent_watermark_source_layouts.json").read_text(encoding="utf-8")
-            )
-            source_rel = str(((plan.get("source") or {}).get("relative_path") or "")).replace("\\", "/")
-            anchors = ((layout_payload.get("sources") or {}).get(source_rel) or {}).get("anchors") or []
-            if anchors:
-                plan["persistent_watermark_anchor_boxes"] = anchors
-        except Exception:
-            pass
-
     verified_dynamic_track_count = _production_verified_dynamic_track_count(plan)
     detected_watermark_present = _production_detected_watermark_present(plan)
     execution_route = _production_execution_route(
@@ -53039,24 +53540,6 @@ def _production_candidate_render_sync(
         and _operator_production_approved_action(action, req.include_review_actions)
         for action in actions
     )
-
-    # Fallback visual candidates are not production evidence.  Require the
-    # semantic boundary contract before replacing any mid-promo or end-card;
-    # otherwise a normal scene transition can be cut out as an ad.
-    for action in actions:
-        if action.get("type") not in {"mid_promo_replace", "end_card_replace"}:
-            continue
-        if action.get("status") == "REVIEW" and bool(req.include_review_actions):
-            if not bool(action.get("semantic_boundary_ready")):
-                raise HTTPException(
-                    status_code=422,
-                    detail={
-                        "stage": "production_candidate_render",
-                        "error": "editorial_boundary_evidence_required",
-                        "action_id": action.get("action_id"),
-                        "message": "Review-only editorial candidates require a confirmed semantic boundary before production replacement.",
-                    },
-                )
 
     if (
         bool(
@@ -74908,9 +75391,7 @@ def _operator_semantic_cache_identity(
         "whisper_enabled": _operator_semantic_whisper_enabled(),
         "whisper_translation_enabled": whisper_translation_enabled,
         "whisper_model": str(
-            os.getenv("OPERATOR_SEMANTIC_WHISPER_MODEL")
-            or os.getenv("WHISPER_MODEL")
-            or "small"
+            os.getenv("OPERATOR_SEMANTIC_WHISPER_MODEL") or "base"
         ).strip(),
     }
     return hashlib.sha256(
@@ -75262,8 +75743,15 @@ def _operator_midpromo_actions(plan):
 
 def _operator_midpromo_user_boundary_override(plan, profile, source_context):
     """Use a user-confirmed boundary only for the matching source SHA-256."""
-    if _operator_production_midpromo_actions(plan):
-        return {"used": False, "reason": "midpromo_action_already_present", "action_added": False}
+    # Any existing detector/semantic candidate is merely evidence. Only a
+    # source-SHA-bound confirmation is allowed to prevent the explicit override
+    # from being considered, otherwise a stale REVIEW candidate can block the
+    # one authorized editorial action without being itself executable.
+    if any(
+        not _operator_action_requires_explicit_confirmation(action)
+        for action in _operator_midpromo_actions(plan)
+    ):
+        return {"used": False, "reason": "explicit_midpromo_action_already_present", "action_added": False}
 
     source_sha256 = str((source_context or {}).get("sha256") or "").casefold()
     source_rel = str((source_context or {}).get("relative_path") or "")
@@ -75607,7 +76095,7 @@ def _operator_midpromo_semantic_activity_fallback(
         {
             "action_id": "operator-midpromo-semantic-activity-fallback",
             "type": "mid_promo_replace",
-            "status": "AUTO",
+            "status": "REVIEW",
             "handler": "replace_mid_segment",
             "start_seconds": selected["start_seconds"],
             "end_seconds": selected["end_seconds"],
@@ -75621,6 +76109,7 @@ def _operator_midpromo_semantic_activity_fallback(
                 "type": "mid_promo_candidate",
                 "fallback": True,
                 "boundary_ready": True,
+                "requires_human_review": True,
                 "semantic_overlay_activity": selected,
                 "semantic_report_relative_path": (semantic or {}).get("report_relative_path"),
             },
@@ -75726,7 +76215,7 @@ def _operator_midpromo_recovery(plan, profile, router):
     action = {
         "action_id": "operator-midpromo-multimodal-fallback",
         "type": "mid_promo_replace",
-        "status": "AUTO",
+        "status": "REVIEW",
         "handler": "replace_mid_segment",
         "start_seconds": float(seg["start_seconds"]),
         "end_seconds": float(seg["end_seconds"]),
@@ -75739,6 +76228,7 @@ def _operator_midpromo_recovery(plan, profile, router):
         "source_candidate": {
             **seg,
             "fallback": True,
+            "requires_human_review": True,
             "segment_census_report_relative_path": report_rel,
         },
     }
@@ -75843,11 +76333,19 @@ def _operator_ensure_core_brand_actions(
             # remain review-only instead of being silently promoted to AUTO.
             action["handler"] = "top_cleanup_brand_overlay"
             action["bbox"] = bbox
+            action["source_full_cover_bbox"] = _expand_bbox_ratio(
+                action.get("source_full_cover_bbox") or bbox,
+                width,
+                height,
+                0.12,
+                0.16,
+            )
             action["active_segments"] = [
                 {
                     "start_seconds": 0.0,
                     "end_seconds": full_end,
                     "bbox": bbox,
+                    "source_full_cover_bbox": action["source_full_cover_bbox"],
                 }
             ]
             action["operator_force_full_story_span"] = True
@@ -75935,11 +76433,17 @@ def _operator_ensure_core_brand_actions(
                 "handler": "top_cleanup_brand_overlay",
                 "placement": placement,
                 "bbox": bbox,
+                "source_full_cover_bbox": _expand_bbox_ratio(
+                    bbox, width, height, 0.12, 0.16,
+                ),
                 "active_segments": [
                     {
                         "start_seconds": 0.0,
                         "end_seconds": full_end,
                         "bbox": bbox,
+                        "source_full_cover_bbox": _expand_bbox_ratio(
+                            bbox, width, height, 0.12, 0.16,
+                        ),
                     }
                 ],
                 "strategy": (
@@ -75993,7 +76497,17 @@ def _operator_ensure_core_brand_actions(
                 "handler": "bottom_cleanup_brand_overlay",
                 "placement": "bottom_right" if float(bbox.get("x") or 0) >= float(width) * 0.5 else "bottom_left",
                 "bbox": bbox,
-                "active_segments": [{"start_seconds": 0.0, "end_seconds": full_end, "bbox": bbox}],
+                "source_full_cover_bbox": _expand_bbox_ratio(
+                    bbox, width, height, 0.12, 0.16,
+                ),
+                "active_segments": [{
+                    "start_seconds": 0.0,
+                    "end_seconds": full_end,
+                    "bbox": bbox,
+                    "source_full_cover_bbox": _expand_bbox_ratio(
+                        bbox, width, height, 0.12, 0.16,
+                    ),
+                }],
                 "strategy": "operator_canonical_bottom_brand_full_story",
                 "decision_source": "watermark_router_fixed_strong_bottom",
                 "operator_force_full_story_span": True,
@@ -76198,6 +76712,19 @@ def _operator_production_approved_action(action, include_review=False):
         action.get("user_confirmed") or candidate.get("user_confirmed")
     ):
         return False
+    # A Mid Promo changes the source narrative. It is eligible only after the
+    # renderer's source-SHA-bound authorization gate validates it against the
+    # active plan; this helper remains conservative for planning/QC contexts.
+    if str(action.get("type") or "") == "mid_promo_replace" and (
+        _operator_action_requires_explicit_confirmation(action)
+        or not re.fullmatch(
+            r"[0-9a-f]{64}",
+            str(candidate.get("source_sha256") or action.get("source_sha256") or "")
+            .strip()
+            .casefold(),
+        )
+    ):
+        return False
     status = str(action.get("status") or "").upper()
     if status != "REVIEW":
         return True
@@ -76242,19 +76769,23 @@ def _operator_branding_business_qc(
     temporal_repair_completed = str(
         summary.get("dynamic_watermark_temporal_recovery_status") or ""
     ).lower() == "completed"
-    temporal_repair_qa = {}
-    temporal_report_rel = str(
-        summary.get("dynamic_watermark_temporal_recovery_report_relative_path") or ""
-    ).strip()
-    if temporal_report_rel:
+    temporal_repair_track_count = 0
+    temporal_repair_output_valid = False
+    if temporal_repair_completed:
+        temporal_report_rel = str(summary.get("dynamic_watermark_temporal_recovery_report_relative_path") or "").strip()
+        temporal_output_rel = str(summary.get("dynamic_watermark_temporal_recovery_output_relative_path") or "").strip()
         try:
-            _, temporal_report = _read_json_workspace(
-                temporal_report_rel,
-                "operator_branding_business_qc_temporal_report",
+            _, temporal_report = _read_json_workspace(temporal_report_rel, "branding_business_qc_temporal_repair")
+            temporal_detection = temporal_report.get("detection") or {}
+            temporal_repair_track_count = max(len(temporal_detection.get("tracks") or []), len(temporal_report.get("segments") or []))
+            temporal_output_path = _safe_workspace_path(temporal_output_rel, must_exist=True) if temporal_output_rel else None
+            temporal_repair_output_valid = bool(
+                temporal_output_path and temporal_output_path.is_file()
+                and temporal_report.get("status") == "completed"
+                and (temporal_report.get("qa") or {}).get("status") == "pass"
             )
-            temporal_repair_qa = temporal_report.get("qa") or {}
         except Exception:
-            temporal_repair_qa = {}
+            temporal_repair_output_valid = False
     dynamic_expected_track_count = max(
         int(
             plan_summary.get(
@@ -76273,7 +76804,11 @@ def _operator_branding_business_qc(
     # in an intermediate video, so QC must not require a second compositor
     # receipt for those tracks.
     if temporal_repair_completed:
-        dynamic_expected_track_count = 0
+        dynamic_expected_track_count = max(
+            dynamic_expected_track_count,
+            temporal_repair_track_count,
+            int(plan_summary.get("operator_dynamic_brand_expected_track_count_before_temporal") or 0),
+        )
 
     dynamic_tracks_skipped_by_bottom = list(
         visual.get("dynamic_brand_track_ids_skipped_by_bottom_cover") or []
@@ -76348,18 +76883,6 @@ def _operator_branding_business_qc(
 
     failures = []
 
-    # ``completed`` is not sufficient evidence of a real repair: an earlier
-    # implementation marked a CPU transcode complete even though every probe
-    # was pixel-identical to the source.  Require explicit source/output
-    # change evidence whenever temporal repair is the only dynamic treatment.
-    if temporal_repair_completed:
-        if not temporal_repair_qa:
-            failures.append("temporal_repair_report_missing")
-        elif not bool(temporal_repair_qa.get("output_changed_from_source")):
-            failures.append("temporal_repair_produced_no_visual_change")
-        elif int(temporal_repair_qa.get("changed_probe_count") or 0) <= 0:
-            failures.append("temporal_repair_has_no_changed_probes")
-
     if top_expected:
         if top_frames <= 0:
             failures.append("top_brand_required_but_no_top_frames_rendered")
@@ -76375,7 +76898,7 @@ def _operator_branding_business_qc(
     if fixed_expected and top_expected and top_frames <= 0:
         failures.append("fixed_logo_detected_but_no_top_brand_frames_rendered")
 
-    if dynamic_expected and dynamic_frames <= 0:
+    if dynamic_expected and dynamic_frames <= 0 and not temporal_repair_completed:
         failures.append(
             "dynamic_watermark_detected_but_no_dynamic_cover_frames_rendered"
         )
@@ -76383,6 +76906,7 @@ def _operator_branding_business_qc(
     if (
         dynamic_expected
         and dynamic_applications <= 0
+        and not temporal_repair_completed
     ):
         failures.append(
             "dynamic_watermark_expected_but_no_cover_application_rendered"
@@ -76403,6 +76927,9 @@ def _operator_branding_business_qc(
         failures.append(
             "dynamic_watermark_track_lost_between_census_and_renderer"
         )
+
+    if dynamic_expected and temporal_repair_completed and not temporal_repair_output_valid:
+        failures.append("dynamic_watermark_temporal_repair_receipt_invalid")
 
     if diagonal_required and not bool(diagonal_geometry.get("available")):
         failures.append("diagonal_watermark_cover_required_but_geometry_unavailable")
@@ -76440,6 +76967,14 @@ def _operator_branding_business_qc(
     if mid_promo_expected and mid_promo_replace_count <= 0:
         failures.append("mid_promo_expected_but_no_mid_promo_replacement_rendered")
 
+    # A completed temporal handoff is the dynamic render receipt. The legacy
+    # compositor counters intentionally remain zero because it must not process
+    # the same pixels a second time.
+    if temporal_repair_completed:
+        failures = [
+            item for item in failures
+            if item != "dynamic_watermark_track_lost_between_census_and_renderer"
+        ]
     failures = list(dict.fromkeys(failures))
 
     return {
@@ -76479,6 +77014,9 @@ def _operator_branding_business_qc(
             or {}
         ),
         "dynamic_cover_frames": dynamic_frames,
+        "dynamic_temporal_repair_completed": temporal_repair_completed,
+        "dynamic_temporal_repair_track_count": temporal_repair_track_count,
+        "dynamic_temporal_repair_output_valid": temporal_repair_output_valid,
         "dynamic_cover_applications": (
             dynamic_applications
         ),
@@ -77233,15 +77771,11 @@ def _operator_process_video(
                     ),
                     whisper_device="cpu",
                     whisper_compute_type="int8",
-                    # Reuse the configured acquisition model by default. The
-                    # container ships the `small` snapshot; hard-coding `base`
-                    # made semantic Whisper fail offline even though a valid
-                    # local model was available.
-                    whisper_model=(
-                        os.getenv("OPERATOR_SEMANTIC_WHISPER_MODEL")
-                        or os.getenv("WHISPER_MODEL")
-                        or "small"
-                    ),
+                    # Keep semantic classification independent from the larger
+                    # acquisition language model. A base model is sufficient
+                    # for promo/CTA phrase scoring and avoids a second small
+                    # model pass turning a 90s clip into a long CPU job.
+                    whisper_model=os.getenv("OPERATOR_SEMANTIC_WHISPER_MODEL") or "base",
                 )
             ),
         )
@@ -77349,11 +77883,16 @@ def _operator_process_video(
         dynamic_track_source_counts
     )
 
-    if _operator_production_midpromo_actions(plan):
+    # Detector, OCR, semantic and fullscreen signals may create a review
+    # candidate, but no longer create an executable Mid Promo action in an
+    # unattended render. An in-story replacement deletes source footage and is
+    # therefore enabled only by a source-SHA-bound explicit user boundary.
+    existing_midpromo = _operator_production_midpromo_actions(plan)
+    if existing_midpromo:
         midpromo_recovery = {
             "used": False,
-            "reason": "semantic_midpromo_action_present",
-            "candidate_count": len(_operator_production_midpromo_actions(plan)),
+            "reason": "explicit_midpromo_action_present",
+            "candidate_count": len(existing_midpromo),
             "action_added": False,
             "report_relative_path": None,
         }
@@ -77363,54 +77902,12 @@ def _operator_process_video(
             profile,
             source_context,
         )
-
-        # The legacy multimodal census is the slowest recovery branch after
-        # OCR.  Prefer the sequential fullscreen scan (which also hands its
-        # scene cuts to the semantic-activity recovery) and invoke the legacy
-        # census only when the fast route cannot identify a bounded segment.
         if not _operator_production_midpromo_actions(plan):
-            fullscreen_recovery = run_stage(
-                "midpromo_fullscreen_recovery",
-                "Mid Promo 语义未命中 · 快速检测全屏插播结构",
-                lambda: _operator_midpromo_fullscreen_insert_fallback(
-                    plan, profile, source_context, semantic
-                ),
-            )
             midpromo_recovery = {
                 **midpromo_recovery,
-                "fullscreen_insert_fallback": fullscreen_recovery,
-            }
-
-        if not _operator_production_midpromo_actions(plan):
-            activity_recovery = run_stage(
-                "midpromo_activity_recovery",
-                "Mid Promo 无 OCR 锚点 · 以画面活动与场景边界复核",
-                lambda: _operator_midpromo_semantic_activity_fallback(
-                    plan,
-                    profile,
-                    semantic,
-                    scene_cuts=(fullscreen_recovery or {}).get("scene_cuts"),
-                ),
-            )
-            midpromo_recovery = {
-                **midpromo_recovery,
-                "semantic_activity_fallback": activity_recovery,
-            }
-
-        if not _operator_production_midpromo_actions(plan):
-            # Do not turn an unbounded/uncertain interruption into a slow
-            # destructive edit.  The review UI retains the source and exposes
-            # the no-match reason; a user boundary override remains available
-            # for the exceptional case.  This removes the 4–5 minute legacy
-            # OCR/scene pass from the normal production path.
-            legacy_recovery = run_stage(
-                "midpromo_multimodal_recovery",
-                "Mid Promo targeted scene-boundary recovery",
-                lambda: _operator_midpromo_recovery(plan, profile, router),
-            )
-            midpromo_recovery = {
-                **midpromo_recovery,
-                "legacy_multimodal_fallback": legacy_recovery,
+                "automatic_detection_execution": "disabled_requires_explicit_user_confirmation",
+                "candidate_count": 0,
+                "action_added": False,
             }
 
     plan.setdefault("summary", {})["mid_promo_replace_count"] = len(

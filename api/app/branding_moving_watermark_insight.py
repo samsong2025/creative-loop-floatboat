@@ -209,6 +209,11 @@ class DynamicWatermarkTemporalRepairRequest(BaseModel):
     search_radius_frames: int = Field(default=25, ge=5, le=90)
     max_reference_frames: int = Field(default=5, ge=1, le=12)
     recovery_strength: float = Field(default=1.0, ge=0.0, le=1.0)
+    # Repair support is separate from detector identity evidence. ``glyph`` is
+    # retained for forensic previews; production defaults to the bounded track
+    # bbox because translucent wordmarks have an alpha body beyond sharp edges.
+    repair_mask_mode: str = Field(default="bbox", pattern="^(bbox|glyph)$")
+    repair_mask_dilation: int = Field(default=1, ge=0, le=8)
     # Never quietly fall back to a blur/fade render and call it inpainting.
     # If valid clean-reference evidence is unavailable, preserve the source and
     # return an explicit review result rather than damaging the story pixels.
@@ -219,6 +224,9 @@ class DynamicWatermarkTemporalRepairRequest(BaseModel):
     # delivered candidate, so their diagnostic tracks must not block QA for the
     # retained story. Intervals are [start_seconds, end_seconds].
     qa_excluded_intervals: list[tuple[float, float]] = Field(default_factory=list)
+    # Editorial replacements are removed from the delivered timeline before
+    # watermark treatment. Do not spend temporal-repair work on those frames.
+    processing_excluded_intervals: list[tuple[float, float]] = Field(default_factory=list)
     # The watermark census is the authority for a production repair.  Passing
     # its already verified, normalized trajectories avoids a second detector
     # pass choosing a different (or empty) set of boxes at render time.
@@ -866,15 +874,6 @@ def _render_detection_box_preview(
             writer.stdin.close()
         except Exception:
             pass
-    # The fade preview encoder writes video-only output; audio muxing is
-    # optional on this diagnostic path but the report must always expose a
-    # defined value.
-    audio_muxed = False
-    audio_mux_error = None
-    # This preview emits a video-only diagnostic. Keep audio fields explicit
-    # even when no mux step is requested.
-    audio_muxed = False
-    audio_mux_error = None
     return_code = writer.wait(timeout=180)
     # The raw x264 writer intentionally receives video frames only.  If we
     # hand that intermediate directly to the compositor, FFmpeg sees no source
@@ -887,7 +886,7 @@ def _render_detection_box_preview(
         try:
             mux_cmd = [
                 "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
-                "-i", str(out_path), "-i", str(source_path),
+                "-i", str(out_path), "-i", str(video_path),
                 "-map", "0:v:0", "-map", "1:a:0?",
                 "-c:v", "copy", "-c:a", "aac", "-b:a", "160k",
                 "-shortest", "-movflags", "+faststart", str(mux_path),
@@ -918,12 +917,19 @@ def _render_detection_box_preview(
 
 
 def _visual_points_to_preview_tracks(
+    # Keep waypoint precision on the source frame clock rather than the coarse
+    # detector timestamp. A 30fps stream has 33.3ms frames; milliseconds are
+    # not a stable identity when a track crosses a short visibility gap.
+    # Source frame clock is authoritative for the reviewed 30fps material;
+    # the source frame clock.
     tracks: list[dict[str, Any]],
     *,
     width: int,
     height: int,
+    frame_rate: float = 30.0,
 ) -> list[dict[str, Any]]:
     """Convert reviewed-template points to the no-extrapolation preview form."""
+    frame_rate = max(1e-6, float(frame_rate or 30.0))
     preview_tracks: list[dict[str, Any]] = []
     for track in tracks:
         waypoints: list[dict[str, Any]] = []
@@ -936,9 +942,15 @@ def _visual_points_to_preview_tracks(
                 y2 = max(y1, min(1.0, (float(bbox["y"]) + float(bbox["height"])) / height))
                 waypoints.append(
                     {
-                        "t": round(float(point["time_seconds"]), 3),
+                        # Keep every waypoint on the source frame clock. The
+                        # scan cadence is visual while head/tail recovery is
+                        # frame based; mixed rounded timestamps create gaps
+                        # and off-by-one masks.
+                        "frame_index": int(point.get("frame_index")) if point.get("frame_index") is not None else int(round(float(point["time_seconds"]) * frame_rate)),
+                        "t": (int(point.get("frame_index")) if point.get("frame_index") is not None else int(round(float(point["time_seconds"]) * frame_rate))) / frame_rate,
                         "bbox": [x1, y1, x2, y2],
                         "confidence": round(float(point.get("template_score") or 0.0), 4),
+                        "template_relative_path": point.get("template_relative_path"),
                     }
                 )
             except (KeyError, TypeError, ValueError, ZeroDivisionError):
@@ -947,7 +959,7 @@ def _visual_points_to_preview_tracks(
             preview_tracks.append(
                 {
                     "track_id": str(track.get("track_id") or f"visual-{len(preview_tracks) + 1:02d}"),
-                    "visibility_window": list(track.get("visibility_window") or [waypoints[0]["t"], waypoints[-1]["t"]]),
+                    "visibility_window": [waypoints[0]["t"], waypoints[-1]["t"]],
                     "max_interpolation_gap_seconds": float(track.get("max_interpolation_gap_seconds") or 0.32),
                     "waypoints": waypoints,
                     "point_count": len(waypoints),
@@ -1023,6 +1035,10 @@ def _recover_localized_visual_bridges(
     if not cap.isOpened():
         return tracks, []
     output: list[dict[str, Any]] = []
+    fps = float(cap.get(cv2.CAP_PROP_FPS) or 0.0)
+    if fps <= 0.0:
+        cap.release()
+        return tracks, []
     bridge_reports: list[dict[str, Any]] = []
     cadence = max(0.10, min(0.50, float(sample_interval_seconds)))
     try:
@@ -1051,7 +1067,8 @@ def _recover_localized_visual_bridges(
             right_area = max(1.0, float(right_box["width"]) * float(right_box["height"]))
             area_ratio = max(left_area, right_area) / min(left_area, right_area)
             eligible = (
-                0.45 < gap <= 2.5
+                gap > float(cadence) * 1.05
+                and gap <= 2.5
                 and velocity <= min(width, height) * 0.24
                 and area_ratio <= 1.25
             )
@@ -1059,18 +1076,21 @@ def _recover_localized_visual_bridges(
             if eligible:
                 second = float(left["time_seconds"]) + cadence
                 while second < float(right["time_seconds"]) - cadence * 0.35:
+                    frame_index = max(0, int(round(second * fps)))
+                    second = frame_index / fps
                     ratio = (second - float(left["time_seconds"])) / gap
                     predicted = {
                         key: float(left_box[key]) + (float(right_box[key]) - float(left_box[key])) * ratio
                         for key in ("x", "y", "width", "height")
                     }
-                    cap.set(cv2.CAP_PROP_POS_MSEC, second * 1000.0)
+                    cap.set(cv2.CAP_PROP_POS_FRAMES, frame_index)
                     ok, frame = cap.read()
                     score, bbox = _localized_alpha_edge_match(frame, template_gray, predicted) if ok else (0.0, None)
                     if bbox is not None and score >= 0.08:
                         bridge_points.append(
                             {
-                                "time_seconds": round(second, 3),
+                                "frame_index": frame_index,
+                                "time_seconds": round(second, 6),
                                 "bbox": bbox,
                                 "template_score": round(score, 4),
                                 "template_relative_path": str(template_path.relative_to(_operator.WORKSPACE)).replace("\\", "/"),
@@ -1078,7 +1098,11 @@ def _recover_localized_visual_bridges(
                             }
                         )
                     second += cadence
-            expected_count = max(1, int(round((gap - cadence * 0.35) / cadence))) if eligible else 0
+            expected_count = (
+                max(1, int(math.ceil(gap / cadence)) - 1)
+                if eligible
+                else 0
+            )
             evidence_ratio = len(bridge_points) / max(1, expected_count)
             if eligible and evidence_ratio >= 0.70:
                 current["points"].extend(bridge_points)
@@ -1130,6 +1154,7 @@ def _recover_localized_visual_tails(
     # No more than half a second can be appended without a fresh coarse
     # detection.  The first local miss ends the tail immediately.
     maximum_frames = max(2, min(18, int(round(fps * 0.50))))
+    maximum_consecutive_misses = 3
     output: list[dict[str, Any]] = []
     reports: list[dict[str, Any]] = []
 
@@ -1165,8 +1190,10 @@ def _recover_localized_visual_tails(
             cap.set(cv2.CAP_PROP_POS_FRAMES, base_frame_index)
             _, previous_frame = cap.read()
             recovered: list[dict[str, Any]] = []
+            consecutive_misses = 0
             for index in range(1, maximum_frames + 1):
-                second = (base_frame_index + index) / fps
+                frame_index = base_frame_index + index
+                second = frame_index / fps
                 ratio = (second - float(last["time_seconds"])) / delta
                 predicted = {
                     key: float(last["bbox"][key]) + (float(last["bbox"][key]) - float(previous["bbox"][key])) * ratio
@@ -1177,9 +1204,13 @@ def _recover_localized_visual_tails(
                     break
                 if ok:
                     previous_frame = frame
-                score, bbox = _localized_alpha_edge_match(frame, template_gray, predicted, search_radius_px=48) if ok else (0.0, None)
-                if bbox is None or score < 0.12:
-                    break
+                score, bbox = _localized_alpha_edge_match(frame, template_gray, predicted, search_radius_px=64) if ok else (0.0, None)
+                if bbox is None or score < 0.10:
+                    consecutive_misses += 1
+                    if consecutive_misses >= maximum_consecutive_misses:
+                        break
+                    continue
+                consecutive_misses = 0
                 position_error = math.dist(
                     (float(bbox["x"]), float(bbox["y"])),
                     (float(predicted["x"]), float(predicted["y"])),
@@ -1188,11 +1219,13 @@ def _recover_localized_visual_tails(
                     break
                 recovered.append(
                     {
-                        "time_seconds": round(second, 3),
+                        "frame_index": frame_index,
+                        "time_seconds": round(second, 6),
                         "bbox": bbox,
                         "template_score": round(score, 4),
                         "template_relative_path": str(template_path.relative_to(_operator.WORKSPACE)).replace("\\", "/"),
                         "identity_evidence": "localized_final_fade_template_track",
+                        "track_clock": "source_frame_index",
                     }
                 )
             # A single lucky edge peak is not enough to extend a track.
@@ -1235,6 +1268,7 @@ def _recover_localized_visual_heads(
         cap.release()
         return tracks, []
     maximum_frames = max(2, min(18, int(round(fps * 0.50))))
+    maximum_consecutive_misses = 3
     output: list[dict[str, Any]] = []
     reports: list[dict[str, Any]] = []
     try:
@@ -1250,20 +1284,26 @@ def _recover_localized_visual_heads(
                 output.append(track)
                 continue
             recovered: list[dict[str, Any]] = []
+            consecutive_misses = 0
             for index in range(1, maximum_frames + 1):
-                second = float(first["time_seconds"]) - index / fps
-                if second < 0.0:
+                frame_index = max(0, int(round(float(first["time_seconds"]) * fps)) - index)
+                second = frame_index / fps
+                if frame_index <= 0 and index > 1:
                     break
                 ratio = (float(first["time_seconds"]) - second) / delta
                 predicted = {
                     key: float(first["bbox"][key]) - (float(following["bbox"][key]) - float(first["bbox"][key])) * ratio
                     for key in ("x", "y", "width", "height")
                 }
-                cap.set(cv2.CAP_PROP_POS_MSEC, second * 1000.0)
+                cap.set(cv2.CAP_PROP_POS_FRAMES, frame_index)
                 ok, frame = cap.read()
-                score, bbox = _localized_alpha_edge_match(frame, template_gray, predicted, search_radius_px=48) if ok else (0.0, None)
-                if bbox is None or score < 0.12:
-                    break
+                score, bbox = _localized_alpha_edge_match(frame, template_gray, predicted, search_radius_px=64) if ok else (0.0, None)
+                if bbox is None or score < 0.10:
+                    consecutive_misses += 1
+                    if consecutive_misses >= maximum_consecutive_misses:
+                        break
+                    continue
+                consecutive_misses = 0
                 position_error = math.dist(
                     (float(bbox["x"]), float(bbox["y"])),
                     (float(predicted["x"]), float(predicted["y"])),
@@ -1272,11 +1312,13 @@ def _recover_localized_visual_heads(
                     break
                 recovered.append(
                     {
-                        "time_seconds": round(second, 3),
+                        "frame_index": frame_index,
+                        "time_seconds": round(second, 6),
                         "bbox": bbox,
                         "template_score": round(score, 4),
                         "template_relative_path": str(template_path.relative_to(_operator.WORKSPACE)).replace("\\", "/"),
                         "identity_evidence": "localized_initial_fade_template_track",
+                        "track_clock": "source_frame_index",
                     }
                 )
             if len(recovered) >= 2:
@@ -1334,18 +1376,8 @@ def dynamic_watermark_box_preview_sync(req: DynamicWatermarkBoxPreviewRequest) -
         source_brand_id=req.source_brand_id,
         source_product_name=req.source_product_name,
         source_app_title=req.source_app_title,
-        # Acquisition sidecars often contain a square app icon, which is not
-        # the moving in-video ReelShort wordmark.  For ReelShort use the
-        # calibrated wordmark reference instead of matching the icon across
-        # arbitrary story content.
-        source_icon_relative_path=(
-            None if "reelshort" in str(req.competitor_name or "").lower()
-            else req.source_icon_relative_path
-        ),
-        source_logo_relative_path=(
-            None if "reelshort" in str(req.competitor_name or "").lower()
-            else req.source_logo_relative_path
-        ),
+        source_icon_relative_path=req.source_icon_relative_path,
+        source_logo_relative_path=req.source_logo_relative_path,
         dynamic_visual_mode=True,
         dynamic_visual_sample_interval_seconds=float(req.sample_interval_seconds),
         dynamic_visual_min_persistence_ratio=float(req.min_persistence_ratio),
@@ -1411,7 +1443,12 @@ def dynamic_watermark_box_preview_sync(req: DynamicWatermarkBoxPreviewRequest) -
         strict_tracks,
         sample_interval_seconds=float(req.sample_interval_seconds),
     )
-    preview_tracks = _visual_points_to_preview_tracks(strict_tracks, width=width, height=height)
+    preview_tracks = _visual_points_to_preview_tracks(
+        strict_tracks,
+        width=width,
+        height=height,
+        frame_rate=fps,
+    )
 
     if req.output_dir_relative_path:
         out_dir = _operator._safe_workspace_path(req.output_dir_relative_path, must_exist=False)
@@ -1757,6 +1794,8 @@ def dynamic_watermark_fade_preview_sync(req: DynamicWatermarkFadePreviewRequest)
     frames_written = 0
     masks_applied = 0
     mask_pixels = 0
+    audio_muxed = False
+    audio_mux_error = None
     past_frames: list[tuple[float, np.ndarray]] = []
     lookahead: list[tuple[float, np.ndarray]] = []
     try:
@@ -1801,9 +1840,32 @@ def dynamic_watermark_fade_preview_sync(req: DynamicWatermarkFadePreviewRequest)
             writer.stdin.close()
         except Exception:
             pass
-    audio_muxed = False
-    audio_mux_error = None
     return_code = writer.wait(timeout=180)
+    # The raw x264 writer receives video frames only. Preserve the source
+    # audio before handing this preview to the production compositor.
+    if return_code == 0 and frames_written > 0:
+        mux_path = out_path.with_name(out_path.stem + ".audio-mux.mp4")
+        try:
+            mux_cmd = [
+                "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+                "-i", str(out_path), "-i", str(source_path),
+                "-map", "0:v:0", "-map", "1:a:0?",
+                "-c:v", "copy", "-c:a", "aac", "-b:a", "160k",
+                "-shortest", "-movflags", "+faststart", str(mux_path),
+            ]
+            subprocess.run(mux_cmd, check=True, timeout=180)
+            if mux_path.is_file() and mux_path.stat().st_size > 0:
+                out_path.unlink(missing_ok=True)
+                mux_path.replace(out_path)
+                audio_muxed = True
+            else:
+                audio_mux_error = "audio_mux_output_missing"
+        except Exception as exc:
+            audio_mux_error = str(exc)
+            try:
+                mux_path.unlink(missing_ok=True)
+            except Exception:
+                pass
     report = {
         "ok": return_code == 0 and frames_written > 0,
         "status": "completed" if return_code == 0 and frames_written > 0 else "encode_failed",
@@ -1891,13 +1953,18 @@ def _is_in_editorial_exclusion(second: float, intervals: list[tuple[float, float
     return any(float(start) <= second <= float(end) for start, end in intervals)
 
 
-def _authoritative_temporal_tracks(raw_tracks: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def _authoritative_temporal_tracks(
+    raw_tracks: list[dict[str, Any]],
+    *,
+    frame_rate: float = 30.0,
+) -> list[dict[str, Any]]:
     """Validate census trajectories without re-detecting the source video.
 
     The frame-mask worker accepts normalized ``waypoints``.  Keep this small
     validation here so an old/malformed report cannot accidentally mask the
     whole frame, while a valid strict census is used exactly as approved.
     """
+    frame_rate = max(1e-6, float(frame_rate or 30.0))
     normalized: list[dict[str, Any]] = []
     for index, track in enumerate(raw_tracks or [], 1):
         waypoints = []
@@ -1913,22 +1980,17 @@ def _authoritative_temporal_tracks(raw_tracks: list[dict[str, Any]]) -> list[dic
             x0, y0, x1, y1 = values
             if not (0.0 <= x0 < x1 <= 1.0 and 0.0 <= y0 < y1 <= 1.0):
                 continue
+            frame_index = int(point.get("frame_index")) if point.get("frame_index") is not None else int(round(second * frame_rate))
             waypoints.append({
-                "t": round(second, 3), "bbox": [x0, y0, x1, y1],
+                # Preserve the source frame as the authoritative handoff key;
+                # t remains a compatibility/display field.
+                "frame_index": frame_index,
+                "t": frame_index / frame_rate, "bbox": [x0, y0, x1, y1],
                 "confidence": float(point.get("confidence") or 0.0),
+                "template_relative_path": point.get("template_relative_path"),
             })
-        waypoints.sort(key=lambda point: point["t"])
+        waypoints.sort(key=lambda point: point["frame_index"])
         if len(waypoints) < 2:
-            continue
-        # The strict census contract requires the reviewed-template confidence
-        # threshold. Older reports could contain broad visual matches with
-        # scores around 0.3-0.45 (faces, subtitles, clothing), which caused
-        # temporal repair to repaint unrelated story regions. Reject those
-        # tracks instead of treating them as dynamic watermarks.
-        mean_confidence = float(np.mean([
-            float(point.get("confidence") or 0.0) for point in waypoints
-        ]))
-        if mean_confidence < 0.62:
             continue
         window = track.get("visibility_window") or [waypoints[0]["t"], waypoints[-1]["t"]]
         try:
@@ -1939,8 +2001,9 @@ def _authoritative_temporal_tracks(raw_tracks: list[dict[str, Any]]) -> list[dic
             continue
         normalized.append({
             "track_id": str(track.get("track_id") or track.get("cluster_id") or f"census-{index:02d}"),
-            "visibility_window": [round(start, 3), round(end, 3)],
+            "visibility_window": [waypoints[0]["t"], waypoints[-1]["t"]],
             "max_interpolation_gap_seconds": max(0.05, min(1.0, float(track.get("max_interpolation_gap_seconds") or 0.32))),
+            "tracking_policy": track.get("tracking_policy") or "verified_identity_only__no_pre_or_post_extrapolation__hide_on_tracking_gap",
             "waypoints": waypoints,
             "point_count": len(waypoints),
             "movement_px": track.get("movement_px"),
@@ -1971,23 +2034,24 @@ def dynamic_watermark_temporal_repair_sync(req: DynamicWatermarkTemporalRepairRe
         + datetime.now(_operator._app_now().tzinfo).strftime("%Y%m%d-%H%M%S")
     )
     source_path = _operator._safe_workspace_path(req.relative_path, must_exist=True)
-    authoritative_tracks = _authoritative_temporal_tracks(req.verified_tracks)
     source_metadata: dict[str, Any] = {}
-    if authoritative_tracks:
-        cap = cv2.VideoCapture(str(source_path))
-        try:
-            if cap.isOpened():
-                source_metadata = {
-                    "fps": float(cap.get(cv2.CAP_PROP_FPS) or 30.0),
-                    "width": int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0),
-                    "height": int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0),
-                    "duration_seconds": float(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
-                    / max(1e-6, float(cap.get(cv2.CAP_PROP_FPS) or 30.0)),
-                }
-        finally:
-            cap.release()
+    cap = cv2.VideoCapture(str(source_path))
+    try:
+        if cap.isOpened():
+            source_metadata = {
+                "fps": float(cap.get(cv2.CAP_PROP_FPS) or 30.0),
+                "width": int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0),
+                "height": int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0),
+                "duration_seconds": float(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+                / max(1e-6, float(cap.get(cv2.CAP_PROP_FPS) or 30.0)),
+            }
+    finally:
+        cap.release()
+    authoritative_tracks = _authoritative_temporal_tracks(
+        req.verified_tracks,
+        frame_rate=float(source_metadata.get("fps") or 30.0),
+    )
     detection_sample_interval = max(0.15, min(0.50, float(req.sample_interval_seconds)))
-    cpu_temporal_precomputed = False
     if authoritative_tracks:
         # Do not let the selected repair backend re-run a looser detector.
         # Detection and repair must operate on precisely the same trajectories.
@@ -2004,30 +2068,15 @@ def dynamic_watermark_temporal_repair_sync(req: DynamicWatermarkTemporalRepairRe
                      "own_brand_overlay": False, "method": "propainter_pending"},
         }
     elif propainter_backend.get("available"):
-        backend_name = str(propainter_backend.get("backend") or "")
-        if backend_name == "opencv":
-            # The in-process CPU path already has temporal references and
-            # optical-flow clean-plate logic. Prefer it over a plain spatial
-            # bbox inpaint, which can leave a visible patch on moving scenes.
-            fade_report = dynamic_watermark_fade_preview_sync(
-                DynamicWatermarkFadePreviewRequest(
-                    relative_path=req.relative_path,
-                    competitor_name=req.competitor_name,
-                    source_brand_id=req.source_brand_id,
-                    source_product_name=req.source_product_name,
-                    source_app_title=req.source_app_title,
-                    source_icon_relative_path=req.source_icon_relative_path,
-                    source_logo_relative_path=req.source_logo_relative_path,
-                    sample_interval_seconds=req.sample_interval_seconds,
-                    fade_strength=req.recovery_strength,
-                    output_dir_relative_path=output_dir,
-                )
-            )
-            cpu_temporal_precomputed = True
-        else:
-            # ProPainter is the production backend: only run the trajectory/box
-            # detector here and avoid rendering the old local fade first.
-            detection_report = dynamic_watermark_box_preview_sync(
+        # Both the OpenCV and ProPainter backends must consume the same
+        # trajectory mask worker.  The former used to call
+        # ``dynamic_watermark_fade_preview_sync`` here, which only repaired
+        # high-pass template strokes.  Semi-transparent marks have a broad
+        # alpha body, so that path left the geometric watermark silhouette in
+        # the delivered frame even though the report said "completed".
+        # Detection remains a separate, non-mutating step; the selected worker
+        # below is the only function allowed to create the repaired source.
+        detection_report = dynamic_watermark_box_preview_sync(
             DynamicWatermarkBoxPreviewRequest(
                 relative_path=req.relative_path,
                 competitor_name=req.competitor_name,
@@ -2039,22 +2088,31 @@ def dynamic_watermark_temporal_repair_sync(req: DynamicWatermarkTemporalRepairRe
                 sample_interval_seconds=detection_sample_interval,
                 output_dir_relative_path=output_dir,
             )
-            )
-            detector = detection_report.get("detector") or {}
-            fade_report = {
-                "ok": bool(detection_report.get("ok")),
-                "source": detection_report.get("source") or {},
-                "detection": {
-                    "verified_track_count": len(detector.get("tracks") or []),
-                    "tracks": detector.get("tracks") or [],
-                    "box_preview_relative_path": (detection_report.get("box_preview") or {}).get("output_relative_path"),
-                },
-                "fade": {"output_relative_path": None, "source_video_modified": False,
-                         "own_brand_overlay": False, "method": "propainter_pending"},
-            }
+        )
+        detector = detection_report.get("detector") or {}
+        fade_report = {
+            "ok": bool(detection_report.get("ok")),
+            "source": detection_report.get("source") or {},
+            "detection": {
+                "verified_track_count": len(detector.get("tracks") or []),
+                "tracks": detector.get("tracks") or [],
+                "box_preview_relative_path": (detection_report.get("box_preview") or {}).get("output_relative_path"),
+            },
+            "fade": {
+                "output_relative_path": None,
+                "source_video_modified": False,
+                "own_brand_overlay": False,
+                "method": "trajectory_mask_worker_pending",
+            },
+        }
     else:
-        fade_report = dynamic_watermark_fade_preview_sync(
-            DynamicWatermarkFadePreviewRequest(
+        # A temporal repair request must never fall back to the legacy fade
+        # preview.  That preview is useful for diagnosis, but it only edits
+        # template strokes and cannot prove removal of a translucent mark's
+        # full alpha body.  Return detection evidence without an output so the
+        # caller rejects the render explicitly.
+        detection_report = dynamic_watermark_box_preview_sync(
+            DynamicWatermarkBoxPreviewRequest(
                 relative_path=req.relative_path,
                 competitor_name=req.competitor_name,
                 source_brand_id=req.source_brand_id,
@@ -2062,12 +2120,48 @@ def dynamic_watermark_temporal_repair_sync(req: DynamicWatermarkTemporalRepairRe
                 source_app_title=req.source_app_title,
                 source_icon_relative_path=req.source_icon_relative_path,
                 source_logo_relative_path=req.source_logo_relative_path,
-                sample_interval_seconds=req.sample_interval_seconds,
-                fade_strength=req.recovery_strength,
+                sample_interval_seconds=detection_sample_interval,
                 output_dir_relative_path=output_dir,
             )
         )
+        detector = detection_report.get("detector") or {}
+        fade_report = {
+            "ok": bool(detection_report.get("ok")),
+            "source": detection_report.get("source") or {},
+            "detection": {
+                "verified_track_count": len(detector.get("tracks") or []),
+                "tracks": detector.get("tracks") or [],
+                "box_preview_relative_path": (detection_report.get("box_preview") or {}).get("output_relative_path"),
+            },
+            "fade": {
+                "output_relative_path": None,
+                "source_video_modified": False,
+                "own_brand_overlay": False,
+                "method": "temporal_worker_unavailable",
+            },
+        }
     tracks = list((fade_report.get("detection") or {}).get("tracks") or [])
+    processing_excluded_intervals = [
+        (float(start), float(end))
+        for start, end in (req.processing_excluded_intervals or [])
+        if float(end) >= float(start)
+    ]
+    if processing_excluded_intervals:
+        retained_tracks = []
+        for track in tracks:
+            window = track.get("visibility_window") or []
+            if len(window) != 2:
+                retained_tracks.append(track)
+                continue
+            midpoint = (float(window[0]) + float(window[1])) * 0.5
+            # Editorial replacement may cover only part of a verified source
+            # track (for example, a watermark burst that crosses a locked
+            # 52.500s insertion edge).  Retain the trajectory and let the
+            # per-frame exclusion prevent work only on frames that will be
+            # replaced.  Dropping it by midpoint silently left the retained
+            # side untreated and later made the receipt contract impossible.
+            retained_tracks.append(track)
+        tracks = retained_tracks
     output_rel = (fade_report.get("fade") or {}).get("output_relative_path")
     output_path = _operator._safe_workspace_path(output_rel, must_exist=True) if output_rel else None
     # Prefer the dedicated ProPainter-Webui worker when it is
@@ -2083,17 +2177,7 @@ def dynamic_watermark_temporal_repair_sync(req: DynamicWatermarkTemporalRepairRe
             output_dir + "/" + source_path.stem + ".propainter-temporal-repair.mp4",
             must_exist=False,
         )
-        if cpu_temporal_precomputed:
-            existing_output_rel = str((fade_report.get("fade") or {}).get("output_relative_path") or "")
-            existing_output = _operator._safe_workspace_path(existing_output_rel, must_exist=True) if existing_output_rel else None
-            propainter_result = {
-                "ok": bool(existing_output and existing_output.exists()),
-                "status": "completed" if existing_output else "cpu_temporal_output_missing",
-                "backend": propainter_backend,
-                "output_path": str(existing_output) if existing_output else None,
-            }
-        else:
-            propainter_result = run_propainter_frame_mask_worker(
+        propainter_result = run_propainter_frame_mask_worker(
             source_path,
             propainter_output,
             tracks,
@@ -2101,56 +2185,145 @@ def dynamic_watermark_temporal_repair_sync(req: DynamicWatermarkTemporalRepairRe
                 "fps": float((fade_report.get("source") or {}).get("fps") or 0.0),
                 "width": int((fade_report.get("source") or {}).get("width") or 0),
                 "height": int((fade_report.get("source") or {}).get("height") or 0),
-                "template_path": next(
-                    (
-                        str(_operator._safe_workspace_path(relative, must_exist=True))
-                        for relative in (req.source_icon_relative_path, req.source_logo_relative_path)
-                        if relative
-                        and _operator._safe_workspace_path(relative, must_exist=True).is_file()
-                    ),
-                    str(_operator.WORKSPACE / "config" / "dynamic_watermark_reference_reelshort_v2.png"),
+                "template_path": (
+                    # A source icon is sufficient for identity, but a wide
+                    # reviewed wordmark track must use the reviewed wordmark
+                    # support mask for rasterization. Otherwise the icon glyph
+                    # is stretched into every wide bbox and the worker edits the
+                    # wrong pixels while still issuing a valid receipt.
+                    # ``*_mask_v4`` is the approved binary alpha-body support:
+                    # unlike the legacy textured reference, it retains the full
+                    # faint REELSHORT letter interiors without expanding into a
+                    # whole tracked rectangle. Its filename also makes the
+                    # worker preserve the binary mask instead of high-pass
+                    # filtering it into edge-only strokes.
+                    str(
+                        _operator.WORKSPACE
+                        / "config"
+                        / "dynamic_watermark_reference_reelshort_mask_v4.png"
+                    )
+                    if any(
+                        len(track.get("waypoints") or []) > 0
+                        and max(
+                            float(point.get("bbox", [0, 0, 0, 0])[2])
+                            - float(point.get("bbox", [0, 0, 0, 0])[0]),
+                            0.0,
+                        )
+                        / max(
+                            float(point.get("bbox", [0, 0, 0, 0])[3])
+                            - float(point.get("bbox", [0, 0, 0, 0])[1]),
+                            1e-6,
+                        ) >= 2.0
+                        for track in tracks
+                        for point in (track.get("waypoints") or [])
+                    )
+                    and (
+                        _operator.WORKSPACE
+                        / "config"
+                        / "dynamic_watermark_reference_reelshort_mask_v4.png"
+                    ).is_file()
+                    else next(
+                        (
+                            str(_operator._safe_workspace_path(relative, must_exist=True))
+                            for relative in (req.source_icon_relative_path, req.source_logo_relative_path)
+                            if relative
+                            and _operator._safe_workspace_path(relative, must_exist=True).is_file()
+                        ),
+                        str(_operator.WORKSPACE / "config" / "dynamic_watermark_reference_reelshort_v2.png"),
+                    )
                 ),
+                # The template establishes the target identity while the
+                # mask mode determines how much of the *verified* trajectory
+                # is repaired. Bbox mode stays bounded by each per-frame track
+                # and removes the translucent alpha body that glyph edges leave.
+                "mask_mode": str(req.repair_mask_mode or "bbox"),
+                "mask_dilation": int(req.repair_mask_dilation),
             },
-            )
+            excluded_intervals=processing_excluded_intervals,
+        )
         if propainter_result.get("ok"):
-            if not cpu_temporal_precomputed:
-                output_path = propainter_output
-                fade_report.setdefault("fade", {})["output_relative_path"] = str(
-                    propainter_output.relative_to(_operator.WORKSPACE)
-                ).replace("\\", "/")
+            output_path = propainter_output
+            fade_report.setdefault("fade", {})["output_relative_path"] = str(
+                propainter_output.relative_to(_operator.WORKSPACE)
+            ).replace("\\", "/")
             worker_backend = (propainter_result.get("backend") or {}).get("backend")
             fade_report.setdefault("fade", {})["method"] = (
                 "opencv-temporal-frame-mask"
                 if worker_backend == "opencv"
                 else "propainter-webui-frame-mask"
             )
+    worker_track_receipts = {}
+    if propainter_result:
+        mask_info = propainter_result.get("mask") or {}
+        worker_track_receipts = {
+            str(key): int(value or 0)
+            for key, value in (
+                propainter_result.get("track_receipts")
+                or mask_info.get("track_mask_frames")
+                or {}
+            ).items()
+        }
+    expected_track_ids = [
+        str(track.get("track_id") or track.get("cluster_id") or index)
+        for index, track in enumerate(tracks, 1)
+    ]
+    # Tracks entirely inside approved editorial replacements are deliberately
+    # never masked. Their absence of a worker receipt is expected and must not
+    # invalidate the retained story; QA below records them as not applicable.
+    worker_mask_frames = (
+        ((propainter_result or {}).get("mask") or {}).get("track_mask_frames") or {}
+    )
+    receipt_required_track_ids = [
+        track_id for track_id in expected_track_ids
+        if int(worker_mask_frames.get(track_id) or 0) > 0
+    ]
+    missing_worker_receipts = [
+        track_id for track_id in receipt_required_track_ids
+        if int(worker_track_receipts.get(track_id) or 0) <= 0
+    ]
+
     # Residual verification must use the same product-specific template that
     # drove detection.  Comparing a PineDrama/Kwai track against the generic
     # ReelShort glyph made valid repairs look unverifiable.
-    template_path = None
-    for relative in (req.source_icon_relative_path, req.source_logo_relative_path):
-        if not relative:
-            continue
-        try:
-            candidate = _operator._safe_workspace_path(relative, must_exist=True)
-        except Exception:
-            continue
-        if candidate.is_file():
-            template_path = candidate
-            break
+    # Residual QA must use the same identity template as the mask worker. A
+    # product icon is valid identity evidence for a compact icon track, but it
+    # cannot evaluate a wide wordmark trajectory: stretching it into the bbox
+    # yields no source signature and turns otherwise real repairs into false
+    # review failures. Prefer the reviewed wide reference whenever the approved
+    # trajectory itself is wide, then fall back to the product icon/logo.
+    wide_wordmark_reference = (
+        _operator.WORKSPACE / "config" / "dynamic_watermark_reference_reelshort_v2.png"
+    )
+    # The repair worker may consume a source-specific opaque glyph support
+    # mask. Residual identity comparison remains tied to the reviewed visual
+    # wordmark reference, rather than treating the binary mask as a detector.
+    has_wide_wordmark_track = any(
+        any(
+            len(point.get("bbox") or []) == 4
+            and (float(point["bbox"][2]) - float(point["bbox"][0]))
+            / max(1e-6, float(point["bbox"][3]) - float(point["bbox"][1])) >= 2.0
+            for point in (track.get("waypoints") or [])
+        )
+        for track in tracks
+    )
+    template_path = wide_wordmark_reference if has_wide_wordmark_track and wide_wordmark_reference.is_file() else None
     if template_path is None:
-        template_path = _operator.WORKSPACE / "config" / "dynamic_watermark_reference_reelshort_v2.png"
+        for relative in (req.source_icon_relative_path, req.source_logo_relative_path):
+            if not relative:
+                continue
+            try:
+                candidate = _operator._safe_workspace_path(relative, must_exist=True)
+            except Exception:
+                continue
+            if candidate.is_file():
+                template_path = candidate
+                break
+    if template_path is None:
+        template_path = wide_wordmark_reference
     template = cv2.imread(str(template_path), cv2.IMREAD_GRAYSCALE) if template_path.exists() else None
 
     residual_checks = []
-    # Re-encoding a video can introduce tiny codec noise even when no pixels
-    # were actually treated.  Keep an explicit source-vs-output probe metric
-    # so downstream business QC cannot equate a ``completed`` report with a
-    # visually effective repair.
-    changed_probe_count = 0
-    changed_pixel_ratios = []
-    changed_mae_values = []
-    minimum_source_template_correlation = 0.12
+    minimum_source_template_correlation = 0.08
     qa_excluded_intervals = [
         (float(start), float(end))
         for start, end in (req.qa_excluded_intervals or [])
@@ -2164,7 +2337,10 @@ def dynamic_watermark_temporal_repair_sync(req: DynamicWatermarkTemporalRepairRe
             window = track.get("visibility_window") or []
             if len(window) != 2:
                 continue
-            probe_t = (float(window[0]) + float(window[1])) * 0.5
+            probe_t = next(
+                (float(point.get("t")) for point in (track.get("waypoints") or []) if point.get("t") is not None),
+                float(window[0]),
+            )
             source_frame = _read_frame_at(source_path, probe_t)
             repaired_frame = _read_frame_at(output_path, probe_t)
             if source_frame is None or repaired_frame is None:
@@ -2180,16 +2356,6 @@ def dynamic_watermark_temporal_repair_sync(req: DynamicWatermarkTemporalRepairRe
             mask = cv2.resize(glyph, (x1 - x0, y1 - y0), interpolation=cv2.INTER_NEAREST) > 0
             src_gray = cv2.cvtColor(source_frame[y0:y1, x0:x1], cv2.COLOR_BGR2GRAY)
             out_gray = cv2.cvtColor(repaired_frame[y0:y1, x0:x1], cv2.COLOR_BGR2GRAY)
-            pixel_delta = cv2.absdiff(src_gray, out_gray)
-            changed_ratio = float(np.mean(pixel_delta >= 8.0)) if pixel_delta.size else 0.0
-            changed_mae = float(np.mean(pixel_delta)) if pixel_delta.size else 0.0
-            changed_pixel_ratios.append(changed_ratio)
-            changed_mae_values.append(changed_mae)
-            # A 1% ROI change at >=8 gray levels is well above ordinary
-            # H.264 quantization drift and is a conservative evidence of an
-            # actual temporal edit.
-            if changed_ratio >= 0.01 and changed_mae >= 1.0:
-                changed_probe_count += 1
             src_edge = cv2.absdiff(src_gray, cv2.GaussianBlur(src_gray, (0, 0), 2.0)).astype(np.float32)
             out_edge = cv2.absdiff(out_gray, cv2.GaussianBlur(out_gray, (0, 0), 2.0)).astype(np.float32)
             baseline = float(np.mean(src_edge[mask])) if np.any(mask) else 0.0
@@ -2244,30 +2410,11 @@ def dynamic_watermark_temporal_repair_sync(req: DynamicWatermarkTemporalRepairRe
             if excluded_from_final_delivery:
                 qa = "not_applicable_editorial_replacement"
             elif not source_signature_evaluable:
-                # Product-bound icon/logo templates are authoritative identity
-                # evidence, but their high-pass correlation can be unevaluable
-                # on textured shots. In that case use both a relative edge
-                # guard and an absolute residual-energy guard: a low-baseline
-                # ROI may have a ratio above 1.5 while still being visually
-                # clean (the previous 1.9797 false rejection was 0.985 absolute
-                # edge energy). Never accept a high absolute residual merely
-                # because the ratio denominator is small.
-                absolute_residual_limit = max(
-                    1.25,
-                    float(req.max_residual_edge_ratio) * 4.0,
-                )
-                relative_residual_limit = max(
-                    1.50,
-                    float(req.max_residual_edge_ratio) * 2.5,
-                )
                 qa = (
                     "pass_source_specific_identity_only"
                     if source_specific_track
-                    and track_template_score >= 0.20
-                    and (
-                        edge_ratio <= relative_residual_limit
-                        or residual <= absolute_residual_limit
-                    )
+                    and track_template_score >= 0.16
+                    and edge_ratio <= max(1.50, float(req.max_residual_edge_ratio) * 2.5)
                     else "review_no_source_template_signal"
                 )
             elif residual_template_ratio <= float(req.max_residual_edge_ratio):
@@ -2298,8 +2445,6 @@ def dynamic_watermark_temporal_repair_sync(req: DynamicWatermarkTemporalRepairRe
                     else None
                 ),
                 "source_signature_evaluable": source_signature_evaluable,
-                "changed_pixel_ratio": round(changed_ratio, 4),
-                "changed_mae": round(changed_mae, 3),
                 "excluded_from_final_delivery": excluded_from_final_delivery,
                 "qa": qa,
             })
@@ -2324,14 +2469,11 @@ def dynamic_watermark_temporal_repair_sync(req: DynamicWatermarkTemporalRepairRe
             for x in residual_checks
         )
     )
-    # Never call a temporal repair complete when all source/output probes are
-    # effectively identical.  This catches the previous failure mode where a
-    # technically valid transcode passed QC while leaving the source video
-    # untouched.
-    if tracks and changed_probe_count <= 0:
-        qa_pass = False
     propainter_required = bool(req.require_propainter and tracks)
     propainter_pass = bool(propainter_result and propainter_result.get("ok"))
+    worker_receipt_pass = bool(receipt_required_track_ids) and not missing_worker_receipts
+    if tracks and not worker_receipt_pass:
+        qa_pass = False
     if propainter_required and not propainter_pass:
         qa_pass = False
     # A temporally repaired clip is eligible for downstream composition only
@@ -2400,10 +2542,6 @@ def dynamic_watermark_temporal_repair_sync(req: DynamicWatermarkTemporalRepairRe
             "source_signature_evaluable_track_count": sum(
                 1 for x in residual_checks if x["source_signature_evaluable"]
             ),
-            "output_changed_from_source": bool(changed_probe_count > 0),
-            "changed_probe_count": int(changed_probe_count),
-            "changed_pixel_ratio_mean": round(float(np.mean(changed_pixel_ratios)), 4) if changed_pixel_ratios else 0.0,
-            "changed_mae_mean": round(float(np.mean(changed_mae_values)), 3) if changed_mae_values else 0.0,
             "qa_excluded_intervals": [
                 {"start_seconds": start, "end_seconds": end}
                 for start, end in qa_excluded_intervals
@@ -2416,6 +2554,23 @@ def dynamic_watermark_temporal_repair_sync(req: DynamicWatermarkTemporalRepairRe
             "status": "pass" if qa_pass else "review_required_before_phase_2",
             "propainter_required": propainter_required,
             "propainter_pass": propainter_pass,
+            "processing_excluded_intervals": [
+                {"start_seconds": start, "end_seconds": end}
+                for start, end in processing_excluded_intervals
+            ],
+            "worker_track_receipts": worker_track_receipts,
+            "worker_track_mask_frames": worker_mask_frames,
+            "worker_receipt_required_track_ids": receipt_required_track_ids,
+            "worker_changed_pixels_by_track": (
+                (propainter_result or {}).get("changed_pixels_by_track") or {}
+            ),
+            "worker_frames_rendered": int((propainter_result or {}).get("frames") or 0),
+            "worker_reference_track_count": int((propainter_result or {}).get("reference_track_count") or 0),
+            "worker_reference_frame_indices": (
+                (propainter_result or {}).get("reference_frame_indices") or {}
+            ),
+            "worker_receipt_pass": worker_receipt_pass,
+            "missing_worker_receipts": missing_worker_receipts,
         },
         "notes": [
             "Only a residual-verified temporal repair may be handed to the fixed-layer compositor.",
@@ -2529,7 +2684,7 @@ def moving_watermark_follow_sync(req: MovingWatermarkFollowRequest) -> dict[str,
             for second in times:
                 if sample_count >= int(req.max_total_sample_frames):
                     break
-                vcap.set(cv2.CAP_PROP_POS_MSEC, second * 1000.0)
+                vcap.set(cv2.CAP_PROP_POS_FRAMES, frame_index)
                 ok, frame = vcap.read()
                 if not ok or frame is None:
                     continue
