@@ -69,6 +69,16 @@ class AgentJobCancelRequest(BaseModel):
     reason: str = Field(default="", max_length=500)
 
 
+class AgentJobDeleteRequest(BaseModel):
+    """Delete an inactive task record after a deliberate UI confirmation.
+
+    The inherited Operator implementation removes only state records and keeps
+    raw/processed/review/output artifacts intact for audit and recovery.
+    """
+
+    confirm_task_id: str = Field(min_length=1, max_length=128)
+
+
 class AgentBBox(BaseModel):
     x: int = Field(ge=0)
     y: int = Field(ge=0)
@@ -185,6 +195,9 @@ def _task_item_summary(item: dict[str, Any]) -> dict[str, Any]:
     source_relative_path = str(item.get("source_video_relative_path") or "").replace("\\", "/").lstrip("/")
     processed_relative_path = str(item.get("processed_video_relative_path") or "").replace("\\", "/").lstrip("/")
     has_processed_output = bool(item.get("processed_video_relative_path"))
+    discard_detail = item.get("discard_detail") if isinstance(item.get("discard_detail"), dict) else {}
+    diagonal_screen = discard_detail.get("diagonal_watermark_screen") if isinstance(discard_detail.get("diagonal_watermark_screen"), dict) else {}
+    diagonal_summary = diagonal_screen.get("summary") if isinstance(diagonal_screen.get("summary"), dict) else {}
     return {
         "item_id": item_id,
         "status": str(item.get("status") or ""),
@@ -200,6 +213,17 @@ def _task_item_summary(item: dict[str, Any]) -> dict[str, Any]:
         "processed_reference": {
             "label": processed_relative_path or None,
             "metadata_label": str(item.get("processed_metadata_sidecar") or "").replace("\\", "/").lstrip("/") or None,
+        },
+        "processing_outcome": {
+            "kind": "discarded" if str(item.get("status") or "") == "DISCARDED" else None,
+            "reason": str(item.get("discard_reason") or "") or None,
+            "message": str(discard_detail.get("message") or "") or None,
+            "screen_report_label": str(diagonal_screen.get("report_relative_path") or "").replace("\\", "/").lstrip("/") or None,
+            "diagonal_watermark_summary": {
+                "persistent_tile_count": int(diagonal_summary.get("persistent_tile_count") or 0),
+                "best_angle_degrees": diagonal_summary.get("best_angle_degrees"),
+                "simultaneous_multi_tile_ratio": float(diagonal_summary.get("simultaneous_multi_tile_ratio") or 0.0),
+            } if diagonal_summary else None,
         },
         "business_qc_pass": bool((item.get("production_qc") or {}).get("branding_business_qc_pass")),
         "has_processed_output": has_processed_output,
@@ -683,6 +707,7 @@ def register_agent_routes(app) -> None:
                 "detail_url_job": True,
                 "job_idempotency": True,
                 "job_cancel": True,
+                "inactive_job_record_delete": True,
                 "review_before_upload": True,
                 "processed_video_preview": True,
                 "insight_login_launch": True,
@@ -761,6 +786,26 @@ def register_agent_routes(app) -> None:
             "job_id": safe_task_id,
             "status": str(result.get("status") or "CANCEL_REQUESTED"),
             "safe_boundary_wait": bool(result.get("safe_boundary_wait")),
+            "message": str(result.get("message") or ""),
+        }
+
+    @app.post("/agent/v1/jobs/{task_id}/delete", tags=["agent-v1"])
+    async def creative_loop_agent_delete(task_id: str, req: AgentJobDeleteRequest):
+        """Remove an inactive task record without deleting production media."""
+        safe_task_id = _safe_segment(task_id, "task_id")
+        if _safe_segment(req.confirm_task_id, "confirm_task_id") != safe_task_id:
+            raise HTTPException(status_code=422, detail={"stage": "agent", "error": "delete_confirmation_mismatch"})
+        result = await asyncio.to_thread(
+            _operator._operator_delete_sync,
+            _operator.OperatorDeleteRequest(task_id=safe_task_id),
+        )
+        return {
+            "ok": bool(result.get("ok")),
+            "api_version": AGENT_API_VERSION,
+            "task_id": safe_task_id,
+            "job_id": safe_task_id,
+            "deleted": bool(result.get("deleted")),
+            "media_deleted": False,
             "message": str(result.get("message") or ""),
         }
 

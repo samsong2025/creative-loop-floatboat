@@ -209,11 +209,6 @@ class DynamicWatermarkTemporalRepairRequest(BaseModel):
     search_radius_frames: int = Field(default=25, ge=5, le=90)
     max_reference_frames: int = Field(default=5, ge=1, le=12)
     recovery_strength: float = Field(default=1.0, ge=0.0, le=1.0)
-    # Repair support is separate from detector identity evidence. ``glyph`` is
-    # retained for forensic previews; production defaults to the bounded track
-    # bbox because translucent wordmarks have an alpha body beyond sharp edges.
-    repair_mask_mode: str = Field(default="bbox", pattern="^(bbox|glyph)$")
-    repair_mask_dilation: int = Field(default=1, ge=0, le=8)
     # Never quietly fall back to a blur/fade render and call it inpainting.
     # If valid clean-reference evidence is unavailable, preserve the source and
     # return an explicit review result rather than damaging the story pixels.
@@ -565,13 +560,23 @@ def _interpolated_waypoint_bbox(waypoints: list[dict[str, Any]], second: float, 
     # is an exact rational (for example 28.333333… at 30fps).  A 1ms boundary
     # allowance prevents the final verified frame from disappearing solely due
     # to that representation mismatch; it is far smaller than one video frame.
-    boundary_tolerance = 0.001
+    # Authoritative tracks are converted to the decoded source-frame clock
+    # before repair. Their persisted visibility window can still carry the
+    # original detector timestamp (for example 4.000009s) while the first
+    # waypoint is exactly 4.000000s at 30fps. A sub-frame allowance accepts
+    # only that representation difference, never real extrapolation.
+    boundary_tolerance = max(0.001, min(0.05, float(max_gap) * 0.10))
     if second < float(rows[0]["t"]) - boundary_tolerance or second > float(rows[-1]["t"]) + boundary_tolerance:
         return None
     for left, right in zip(rows, rows[1:]):
         start, end = float(left.get("t", 0.0)), float(right.get("t", 0.0))
         if start <= second <= end:
-            if end - start > max_gap:
+            # ``t`` is reconstructed from decoded frame indices. At fractional
+            # frame rates, two source frames exactly one second apart can be
+            # represented as 1.000002s, which is not a genuine tracking gap.
+            # Apply only the existing sub-frame boundary allowance here; a
+            # materially larger gap remains strictly rejected.
+            if end - start > max_gap + boundary_tolerance:
                 return None
             ratio = 0.0 if end <= start else (second - start) / (end - start)
             return [float(a) + (float(b) - float(a)) * ratio for a, b in zip(left["bbox"], right["bbox"])]
@@ -2232,12 +2237,14 @@ def dynamic_watermark_temporal_repair_sync(req: DynamicWatermarkTemporalRepairRe
                         str(_operator.WORKSPACE / "config" / "dynamic_watermark_reference_reelshort_v2.png"),
                     )
                 ),
-                # The template establishes the target identity while the
-                # mask mode determines how much of the *verified* trajectory
-                # is repaired. Bbox mode stays bounded by each per-frame track
-                # and removes the translucent alpha body that glyph edges leave.
-                "mask_mode": str(req.repair_mask_mode or "bbox"),
-                "mask_dilation": int(req.repair_mask_dilation),
+                # The reviewed trajectory bbox is the authorized repair area.
+                # Semi-transparent REELSHORT marks retain a broad alpha body
+                # beyond a high-pass glyph support, so a glyph-only mask leaves
+                # visually readable letters.  Repair the complete verified bbox;
+                # the worker remains constrained to the observed trajectory and
+                # never applies this strategy outside its visibility window.
+                "mask_mode": "bbox",
+                "mask_dilation": 0,
             },
             excluded_intervals=processing_excluded_intervals,
         )
@@ -2253,15 +2260,14 @@ def dynamic_watermark_temporal_repair_sync(req: DynamicWatermarkTemporalRepairRe
                 else "propainter-webui-frame-mask"
             )
     worker_track_receipts = {}
+    worker_mask_info = (propainter_result or {}).get("mask") or {}
     if propainter_result:
-        mask_info = propainter_result.get("mask") or {}
+        # A mask manifest is planning evidence, not proof that the GPU worker
+        # produced or applied any repaired pixels. Never substitute
+        # ``track_mask_frames`` for a missing worker receipt after a failure.
         worker_track_receipts = {
             str(key): int(value or 0)
-            for key, value in (
-                propainter_result.get("track_receipts")
-                or mask_info.get("track_mask_frames")
-                or {}
-            ).items()
+            for key, value in (propainter_result.get("track_receipts") or {}).items()
         }
     expected_track_ids = [
         str(track.get("track_id") or track.get("cluster_id") or index)
@@ -2270,8 +2276,12 @@ def dynamic_watermark_temporal_repair_sync(req: DynamicWatermarkTemporalRepairRe
     # Tracks entirely inside approved editorial replacements are deliberately
     # never masked. Their absence of a worker receipt is expected and must not
     # invalidate the retained story; QA below records them as not applicable.
-    worker_mask_frames = (
-        ((propainter_result or {}).get("mask") or {}).get("track_mask_frames") or {}
+    worker_mask_frames = worker_mask_info.get("track_mask_frames") or {}
+    worker_output_covered_mask_frames = (
+        worker_mask_info.get("output_covered_mask_frames") or {}
+    )
+    worker_changed_pixels_by_track = (
+        (propainter_result or {}).get("changed_pixels_by_track") or {}
     )
     receipt_required_track_ids = [
         track_id for track_id in expected_track_ids
@@ -2279,7 +2289,12 @@ def dynamic_watermark_temporal_repair_sync(req: DynamicWatermarkTemporalRepairRe
     ]
     missing_worker_receipts = [
         track_id for track_id in receipt_required_track_ids
-        if int(worker_track_receipts.get(track_id) or 0) <= 0
+        if (
+            int(worker_track_receipts.get(track_id) or 0) <= 0
+            or int(worker_changed_pixels_by_track.get(track_id) or 0) <= 0
+            or int(worker_output_covered_mask_frames.get(track_id) or 0)
+            != int(worker_mask_frames.get(track_id) or 0)
+        )
     ]
 
     # Residual verification must use the same product-specific template that
@@ -2561,9 +2576,9 @@ def dynamic_watermark_temporal_repair_sync(req: DynamicWatermarkTemporalRepairRe
             "worker_track_receipts": worker_track_receipts,
             "worker_track_mask_frames": worker_mask_frames,
             "worker_receipt_required_track_ids": receipt_required_track_ids,
-            "worker_changed_pixels_by_track": (
-                (propainter_result or {}).get("changed_pixels_by_track") or {}
-            ),
+            "worker_changed_pixels_by_track": worker_changed_pixels_by_track,
+            "worker_output_covered_mask_frames": worker_output_covered_mask_frames,
+            "worker_receipt_kind": (propainter_result or {}).get("receipt_kind"),
             "worker_frames_rendered": int((propainter_result or {}).get("frames") or 0),
             "worker_reference_track_count": int((propainter_result or {}).get("reference_track_count") or 0),
             "worker_reference_frame_indices": (

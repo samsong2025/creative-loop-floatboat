@@ -21,6 +21,49 @@ import cv2
 import numpy as np
 
 
+def _positive_int_env(name: str, default: int) -> int:
+    """Read a positive integer deployment setting without breaking a job."""
+    try:
+        value = int(str(os.environ.get(name) or default).strip())
+    except (TypeError, ValueError):
+        value = default
+    return max(1, value)
+
+
+def _propainter_segment_frame_limit(
+    backend: dict[str, Any],
+    processing_profile: dict[str, Any],
+    source_frame_count: int,
+) -> int:
+    """Return a bounded inference-window length for one ProPainter process.
+
+    The upstream CLI loads every supplied frame into tensors before its own
+    ``--subvideo_length`` batching takes effect. That setting therefore cannot
+    cap peak memory for a merged trajectory window. On 8 GB GPUs, a 70+ frame
+    768-pixel portrait window is enough to make the CUDA child exit by SIGKILL.
+
+    Splitting protects memory only. The compositor still copies generated pixels
+    only within verified masks and the existing receipt and residual-QA gates
+    remain mandatory.
+    """
+    source_frame_count = max(1, int(source_frame_count or 1))
+    raw = str(os.environ.get("PROPAINTER_MAX_SEGMENT_FRAMES") or "").strip()
+    if raw:
+        try:
+            configured = int(raw)
+        except (TypeError, ValueError):
+            configured = 24
+    else:
+        configured = (
+            24
+            if processing_profile.get("profile_source") == "adaptive_low_vram"
+            else source_frame_count
+        )
+    # Preserve enough temporal context while treating malformed configuration as
+    # a safe bounded window rather than allowing an unbounded child process.
+    return min(source_frame_count, max(12, min(120, configured)))
+
+
 def probe_propainter_backend() -> dict[str, Any]:
     """Discover the configured video-repair backend.
 
@@ -45,15 +88,25 @@ def probe_propainter_backend() -> dict[str, Any]:
                 "import torch; "
                 "print(torch.version.cuda or ''); "
                 "print(torch.version.hip or ''); "
-                "print(int(torch.cuda.is_available()))"
+                "print(int(torch.cuda.is_available())); "
+                "print(int(torch.cuda.get_device_properties(0).total_memory "
+                "// (1024 * 1024)) if torch.cuda.is_available() else 0)"
             )],
             capture_output=True, text=True, timeout=60, check=False,
         )
-        lines = [line.strip() for line in probe.stdout.splitlines() if line.strip()]
+        # Keep positional empty fields: on a CUDA build ``torch.version.hip`` is
+        # normally empty. Filtering blank lines would shift the final 0/1 CUDA
+        # availability flag into the HIP field and falsely report no accelerator.
+        lines = [line.strip() for line in probe.stdout.splitlines()]
         torch_info = {
-            "torch_cuda_build": lines[0] if lines else None,
-            "torch_hip_build": lines[1] if len(lines) > 1 else None,
+            "torch_cuda_build": lines[0] if len(lines) > 0 and lines[0] else None,
+            "torch_hip_build": lines[1] if len(lines) > 1 and lines[1] else None,
             "torch_accelerator_available": bool(len(lines) > 2 and lines[2] == "1"),
+            "gpu_memory_total_mb": (
+                int(lines[3])
+                if len(lines) > 3 and lines[3].isdigit()
+                else None
+            ),
         }
     except Exception as exc:
         torch_info = {"probe_error": str(exc)}
@@ -131,6 +184,102 @@ def probe_propainter_backend() -> dict[str, Any]:
         "supports_frame_masks": True,
         "directml_available": directml_available,
         **torch_info,
+    }
+
+
+def _propainter_processing_profile(
+    source_width: int,
+    source_height: int,
+    backend: dict[str, Any],
+) -> dict[str, Any]:
+    """Select a memory-safe ProPainter inference size.
+
+    ProPainter restores the requested *processing* size in its output.  The
+    caller subsequently rescales that candidate only inside verified masks,
+    so this helper never changes the dimensions of the delivered video.  A
+    full-resolution 1080x1920 portrait sequence needs substantially more than
+    8 GB VRAM even in fp16 mode; defaulting such devices to a 768-pixel long
+    edge avoids an OS-level SIGKILL while preserving the source aspect ratio.
+    """
+    if source_width <= 0 or source_height <= 0:
+        return {
+            "ok": False,
+            "status": "invalid_source_dimensions",
+            "source_dimensions": [source_width, source_height],
+        }
+
+    configured_width = str(os.environ.get("PROPAINTER_PROCESS_WIDTH") or "").strip()
+    configured_height = str(os.environ.get("PROPAINTER_PROCESS_HEIGHT") or "").strip()
+    if bool(configured_width) != bool(configured_height):
+        return {
+            "ok": False,
+            "status": "incomplete_processing_dimensions",
+            "message": (
+                "PROPAINTER_PROCESS_WIDTH and PROPAINTER_PROCESS_HEIGHT must "
+                "be set together so verified-mask geometry is not distorted."
+            ),
+        }
+
+    profile_source = "native"
+    if configured_width and configured_height:
+        try:
+            target_width = int(configured_width)
+            target_height = int(configured_height)
+        except ValueError:
+            return {
+                "ok": False,
+                "status": "invalid_processing_dimensions",
+                "configured_width": configured_width,
+                "configured_height": configured_height,
+            }
+        if target_width <= 0 or target_height <= 0:
+            return {
+                "ok": False,
+                "status": "invalid_processing_dimensions",
+                "configured_width": configured_width,
+                "configured_height": configured_height,
+            }
+        profile_source = "explicit_environment"
+    else:
+        try:
+            gpu_memory_mb = int(backend.get("gpu_memory_total_mb") or 0)
+        except (TypeError, ValueError):
+            gpu_memory_mb = 0
+        low_vram_limit_mb = _positive_int_env(
+            "PROPAINTER_LOW_VRAM_MAX_MB", 10240
+        )
+        if gpu_memory_mb and gpu_memory_mb <= low_vram_limit_mb:
+            long_edge = _positive_int_env("PROPAINTER_LOW_VRAM_LONG_EDGE", 768)
+            scale = min(1.0, float(long_edge) / max(source_width, source_height))
+            target_width = max(8, int(round(source_width * scale / 8.0)) * 8)
+            target_height = max(8, int(round(source_height * scale / 8.0)) * 8)
+            profile_source = "adaptive_low_vram"
+        else:
+            target_width, target_height = source_width, source_height
+
+    # Resize masks and frames with the same aspect ratio.  The inference script
+    # itself crops processing dimensions to multiples of eight, therefore doing
+    # so here keeps the candidate dimensions predictable for verification.
+    target_width = max(8, int(round(target_width / 8.0)) * 8)
+    target_height = max(8, int(round(target_height / 8.0)) * 8)
+    source_aspect = float(source_width) / float(source_height)
+    target_aspect = float(target_width) / float(target_height)
+    if abs(source_aspect - target_aspect) > 0.015:
+        return {
+            "ok": False,
+            "status": "processing_aspect_ratio_mismatch",
+            "source_dimensions": [source_width, source_height],
+            "processing_dimensions": [target_width, target_height],
+        }
+    return {
+        "ok": True,
+        "source_dimensions": [source_width, source_height],
+        "processing_dimensions": [target_width, target_height],
+        "scaled": bool(
+            target_width != source_width or target_height != source_height
+        ),
+        "profile_source": profile_source,
+        "gpu_memory_total_mb": backend.get("gpu_memory_total_mb"),
     }
 
 
@@ -219,6 +368,7 @@ def _write_frame_masks(
     dilation: int = 2,
     mask_mode: str = "bbox",
     excluded_intervals: Optional[list[tuple[float, float]]] = None,
+    time_offset_seconds: float = 0.0,
 ) -> dict[str, Any]:
     cap = cv2.VideoCapture(str(source_path))
     if not cap.isOpened():
@@ -242,7 +392,9 @@ def _write_frame_masks(
     }
     try:
         for index in range(max(0, count)):
-            second = index / max(1e-6, fps)
+            # Segment masks use local frame indices, while authoritative tracks
+            # remain expressed on the source-video timeline.
+            second = float(time_offset_seconds) + index / max(1e-6, fps)
             mask = np.zeros((height, width), dtype=np.uint8)
             if any(start <= second <= end for start, end in normalized_exclusions):
                 cv2.imwrite(str(mask_dir / f"{index:06d}.png"), mask)
@@ -416,6 +568,65 @@ def _temporal_clean_patch(
         if border_error > max(18.0, border_scale * 1.35):
             return None
         return aligned
+    except Exception:
+        return None
+
+
+def _temporal_clean_patch_with_context(
+    current: np.ndarray,
+    reference: np.ndarray,
+    x0: int,
+    y0: int,
+    x1: int,
+    y1: int,
+) -> Optional[np.ndarray]:
+    """Align a clean temporal plate using surrounding scene context.
+
+    Flow estimated only inside a watermark box often locks onto the watermark
+    itself. Estimate and validate on a padded neighbourhood, then crop the
+    aligned plate back to the already-authorized tracked box.
+    """
+    if current is None or reference is None or current.shape != reference.shape:
+        return None
+    if x1 <= x0 or y1 <= y0:
+        return None
+    frame_height, frame_width = current.shape[:2]
+    pad = max(12, min(64, int(round(max(x1 - x0, y1 - y0) * 0.22))))
+    outer_x0, outer_y0 = max(0, x0 - pad), max(0, y0 - pad)
+    outer_x1, outer_y1 = min(frame_width, x1 + pad), min(frame_height, y1 + pad)
+    if outer_x1 <= outer_x0 or outer_y1 <= outer_y0:
+        return None
+    current_outer = current[outer_y0:outer_y1, outer_x0:outer_x1]
+    reference_outer = reference[outer_y0:outer_y1, outer_x0:outer_x1]
+    try:
+        current_gray = cv2.cvtColor(current_outer, cv2.COLOR_BGR2GRAY)
+        reference_gray = cv2.cvtColor(reference_outer, cv2.COLOR_BGR2GRAY)
+        flow = cv2.calcOpticalFlowFarneback(
+            reference_gray, current_gray, None, 0.35, 3, 21, 4, 7, 1.1, 0
+        )
+        gx, gy = np.meshgrid(
+            np.arange(reference_outer.shape[1], dtype=np.float32),
+            np.arange(reference_outer.shape[0], dtype=np.float32),
+        )
+        aligned_outer = cv2.remap(
+            reference_outer, gx - flow[..., 0], gy - flow[..., 1],
+            cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT,
+        )
+        ring = np.ones(current_gray.shape, dtype=np.uint8)
+        inner_x0, inner_y0 = x0 - outer_x0, y0 - outer_y0
+        inner_x1, inner_y1 = x1 - outer_x0, y1 - outer_y0
+        ring[inner_y0:inner_y1, inner_x0:inner_x1] = 0
+        if not np.any(ring):
+            return None
+        observed = current_gray[ring > 0].astype(np.float32)
+        aligned = cv2.cvtColor(aligned_outer, cv2.COLOR_BGR2GRAY)[ring > 0].astype(np.float32)
+        if observed.size == 0 or aligned.size == 0:
+            return None
+        border_error = float(np.median(np.abs(observed - aligned)))
+        scene_scale = max(8.0, float(np.median(np.abs(observed - np.median(observed)))))
+        if border_error > max(18.0, scene_scale * 1.35):
+            return None
+        return aligned_outer[inner_y0:inner_y1, inner_x0:inner_x1]
     except Exception:
         return None
 
@@ -663,7 +874,10 @@ def _run_opencv_temporal_mask_worker(
                     if x1 <= x0 or y1 <= y0:
                         continue
                     local_mask = mask[y0:y1, x0:x1]
-                    patch = _temporal_clean_patch(frame, reference, x0, y0, x1, y1) if reference is not None else None
+                    patch = (
+                        _temporal_clean_patch_with_context(frame, reference, x0, y0, x1, y1)
+                        if reference is not None else None
+                    )
                     if local_mask.size == 0:
                         continue
                     if patch is None:
@@ -734,10 +948,16 @@ def _run_opencv_temporal_mask_worker(
 
     ffmpeg = shutil.which("ffmpeg")
     if ffmpeg:
+        # Some source creatives contain an audio stream longer than their video
+        # stream. Apply the repaired video's measured frame duration as an
+        # explicit mux limit; relying on ``-shortest`` with stream-copy audio
+        # leaves long silent tails in those files.
+        video_duration_seconds = frames / max(1e-6, fps)
         mux = subprocess.run(
             [ffmpeg, "-y", "-i", str(temp_video), "-i", str(source_path),
              "-map", "0:v:0", "-map", "1:a?", "-c:v", "libx264", "-preset", "veryfast",
-             "-crf", "18", "-c:a", "copy", "-shortest", str(output_path)],
+             "-crf", "18", "-c:a", "aac", "-t", f"{video_duration_seconds:.6f}",
+             "-shortest", str(output_path)],
             capture_output=True, text=True, timeout=600, check=False,
         )
         if mux.returncode != 0 or not output_path.exists():
@@ -796,100 +1016,369 @@ def run_propainter_frame_mask_worker(
     timeout_seconds: Optional[float] = None,
     excluded_intervals: Optional[list[tuple[float, float]]] = None,
 ) -> dict[str, Any]:
+    """Run GPU ProPainter only on bounded authoritative-track windows.
+
+    A full source clip is never supplied to ProPainter: that causes its temporal
+    model to retain unnecessary 1080x1920 frames and can be OOM-killed.  The
+    repaired windows are composited back into a fresh full-length video, while
+    per-track receipts compare source and generated pixels inside the exact
+    approved masks.  A mask manifest alone is deliberately not a receipt.
+    """
     backend = probe_propainter_backend()
     if not backend.get("available"):
         return {"ok": False, "status": "not_configured", "backend": backend}
+    if backend.get("backend") == "opencv":
+        # GPU-only deployments must not silently select the legacy worker.
+        return {"ok": False, "status": "gpu_propainter_required", "backend": backend}
     source_path, output_path = Path(source_path), Path(output_path)
-    timeout = float(timeout_seconds or os.environ.get("PROPAINTER_TIMEOUT_SECONDS") or 3600)
+    if output_path.exists():
+        return {"ok": False, "status": "output_path_already_exists", "backend": backend}
     root_value = backend.get("root")
     root = Path(root_value) if root_value else None
-    with tempfile.TemporaryDirectory(prefix="creative-loop-propainter-") as temp:
-        temp_dir = Path(temp)
-        mask_dir = temp_dir / "masks"
-        render_dir = temp_dir / "render"
-        try:
-            # A reviewed source-specific ``*_mask_*.png`` is an explicit
-            # wordmark support map, not a generic detection template.  Default
-            # to that narrow glyph support whenever it is supplied; requiring a
-            # process-wide environment override here previously let the full
-            # tracking rectangle reach the CPU worker and produced visible
-            # clean-plate blocks over faces and clothing.
-            supplied_metadata = metadata or {}
-            selected_mask_mode = str(
-                supplied_metadata.get("mask_mode")
-                or os.environ.get("PROPAINTER_MASK_MODE")
-                or ""
-            ).strip().lower()
-            template_value = str(supplied_metadata.get("template_path") or "")
-            template_name = Path(template_value).stem.lower()
-            if not selected_mask_mode and (
-                "_mask_" in template_name or "mask-" in template_name
+    if root is None:
+        return {"ok": False, "status": "backend_root_missing", "backend": backend}
+    timeout = float(timeout_seconds or os.environ.get("PROPAINTER_TIMEOUT_SECONDS") or 3600)
+    supplied_metadata = metadata or {}
+    selected_mask_mode = str(supplied_metadata.get("mask_mode") or os.environ.get("PROPAINTER_MASK_MODE") or "").strip().lower()
+    template_value = str(supplied_metadata.get("template_path") or "")
+    if not selected_mask_mode and ("_mask_" in Path(template_value).stem.lower() or "mask-" in Path(template_value).stem.lower()):
+        selected_mask_mode = "glyph"
+    if selected_mask_mode not in {"bbox", "glyph"}:
+        selected_mask_mode = "bbox"
+    try:
+        selected_dilation = int(supplied_metadata.get("mask_dilation", os.environ.get("PROPAINTER_MASK_DILATION") or 2))
+    except (TypeError, ValueError):
+        selected_dilation = 2
+    cap = cv2.VideoCapture(str(source_path))
+    if not cap.isOpened():
+        return {"ok": False, "status": "source_open_failed", "backend": backend}
+    try:
+        fps = float(cap.get(cv2.CAP_PROP_FPS) or 30.0)
+        frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
+        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
+    finally:
+        cap.release()
+    if frame_count <= 0 or width <= 0 or height <= 0:
+        return {"ok": False, "status": "invalid_video_metadata", "backend": backend}
+    processing_profile = _propainter_processing_profile(width, height, backend)
+    if not processing_profile.get("ok"):
+        return {
+            "ok": False,
+            "status": str(processing_profile.get("status") or "processing_profile_invalid"),
+            "backend": backend,
+            "processing_profile": processing_profile,
+        }
+    processing_width, processing_height = [
+        int(value)
+        for value in processing_profile["processing_dimensions"]
+    ]
+    segment_frame_limit = _propainter_segment_frame_limit(
+        backend,
+        processing_profile,
+        frame_count,
+    )
+    try:
+        context_frames = max(2, min(90, int(os.environ.get("PROPAINTER_SEGMENT_CONTEXT_FRAMES") or 18)))
+    except ValueError:
+        context_frames = 18
+    windows: list[list[int]] = []
+    for track in tracks:
+        window = track.get("visibility_window") or []
+        if len(window) != 2:
+            continue
+        start = max(0, int(math.floor(float(window[0]) * fps)) - context_frames)
+        end = min(frame_count - 1, int(math.ceil(float(window[1]) * fps)) + context_frames)
+        if end >= start:
+            windows.append([start, end])
+    windows.sort()
+    merged_windows: list[list[int]] = []
+    for start, end in windows:
+        if merged_windows and start <= merged_windows[-1][1] + 1:
+            merged_windows[-1][1] = max(merged_windows[-1][1], end)
+        else:
+            merged_windows.append([start, end])
+    # ``--subvideo_length`` batches later inference stages only; the upstream
+    # CLI still materializes every frame in this process first. Bound each child
+    # process independently so nearby tracks cannot merge into an OOM-prone
+    # 70+ frame portrait window on 8 GB GPUs.
+    bounded_windows: list[list[int]] = []
+    for start, end in merged_windows:
+        cursor = int(start)
+        while cursor <= int(end):
+            bounded_end = min(int(end), cursor + segment_frame_limit - 1)
+            # RAFT derives an optical-flow batch from consecutive frame pairs.
+            # A final one-frame remainder therefore produces a zero-length batch
+            # and fails at its correlation reshape. Overlap that tail with the
+            # preceding segment instead: all original frames remain covered,
+            # the compositor retains its source-timeline order, and every
+            # ProPainter subprocess gets the minimum two-frame input it needs.
+            if (
+                bounded_end == int(end)
+                and bounded_end == cursor
+                and bounded_windows
+                and int(bounded_windows[-1][1]) == cursor - 1
+                and int(bounded_windows[-1][1]) - int(bounded_windows[-1][0]) + 1 > 2
             ):
-                selected_mask_mode = "glyph"
-            if selected_mask_mode not in {"bbox", "glyph"}:
-                selected_mask_mode = "bbox"
-            try:
-                selected_dilation = int(
-                    supplied_metadata.get(
-                        "mask_dilation",
-                        os.environ.get("PROPAINTER_MASK_DILATION") or 2,
-                    )
+                # Make the tail two frames long without overlap: move the last
+                # frame of the preceding full segment into the one-frame tail.
+                # Overlapping segments would make the sequential compositor
+                # consume a candidate's frame N at source time N+1.
+                bounded_windows[-1][1] = cursor - 2
+                bounded_windows.append([cursor - 1, bounded_end])
+            else:
+                bounded_windows.append([cursor, bounded_end])
+            cursor = bounded_end + 1
+    merged_windows = bounded_windows
+    if not merged_windows:
+        return {"ok": False, "status": "no_authoritative_track_windows", "backend": backend}
+    try:
+        requested_subvideo_length = int(os.environ.get("PROPAINTER_SUBVIDEO_LENGTH") or 80)
+    except ValueError:
+        requested_subvideo_length = 80
+    subvideo_length = max(3, min(80, requested_subvideo_length))
+    track_receipts = {str(track.get("track_id") or track.get("cluster_id") or index): 0 for index, track in enumerate(tracks, 1)}
+    changed_pixels_by_track = {key: 0 for key in track_receipts}
+    track_output_frames = {key: 0 for key in track_receipts}
+    segment_records: list[dict[str, Any]] = []
+    with tempfile.TemporaryDirectory(prefix="creative-loop-propainter-segmented-") as temp:
+        temp_dir = Path(temp)
+        try:
+            for segment_index, (start_frame, end_frame) in enumerate(merged_windows, 1):
+                segment_dir = temp_dir / f"segment-{segment_index:03d}"
+                segment_dir.mkdir(parents=True, exist_ok=True)
+                segment_path = segment_dir / "source.mp4"
+                writer = cv2.VideoWriter(str(segment_path), cv2.VideoWriter_fourcc(*"mp4v"), fps, (width, height))
+                if not writer.isOpened():
+                    return {"ok": False, "status": "segment_writer_unavailable", "backend": backend}
+                reader = cv2.VideoCapture(str(source_path))
+                try:
+                    reader.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
+                    for _ in range(start_frame, end_frame + 1):
+                        ok, frame = reader.read()
+                        if not ok or frame is None:
+                            return {"ok": False, "status": "segment_source_read_failed", "backend": backend}
+                        writer.write(frame)
+                finally:
+                    reader.release()
+                    writer.release()
+                offset_seconds = start_frame / max(1e-6, fps)
+                combined_mask_dir = segment_dir / "masks"
+                combined_mask = _write_frame_masks(
+                    segment_path, combined_mask_dir, tracks, template_path=template_value or None,
+                    dilation=max(0, min(8, selected_dilation)), mask_mode=selected_mask_mode,
+                    excluded_intervals=excluded_intervals, time_offset_seconds=offset_seconds,
                 )
-            except (TypeError, ValueError):
-                selected_dilation = 2
-            mask_info = _write_frame_masks(
-                source_path, mask_dir, tracks,
-                template_path=template_value or None,
-                dilation=max(0, min(8, selected_dilation)),
-                mask_mode=selected_mask_mode,
-                excluded_intervals=excluded_intervals,
-            )
-            # Keep the exact trajectories alongside the mask manifest so the
-            # portable worker can issue per-track coverage receipts and select
-            # clean reference frames without re-detecting the source.
-            mask_info["tracks"] = tracks
-            if backend.get("backend") == "opencv":
-                result = _run_opencv_temporal_mask_worker(source_path, output_path, mask_info)
-                result["backend"] = backend
-                return result
-            if root is None:
-                return {"ok": False, "status": "backend_root_missing", "backend": backend, "mask": mask_info, "track_receipts": mask_info.get("track_mask_frames") or {}}
-            script = root / "ProPainter" / "inference_propainter.py"
-            command = [os.environ.get("PROPAINTER_PYTHON") or "python", str(script),
-                       "--video", str(source_path), "--mask", str(mask_dir),
-                       "--output", str(render_dir), "--subvideo_length",
-                       str(int(os.environ.get("PROPAINTER_SUBVIDEO_LENGTH") or 80))]
-            resize_ratio = float(os.environ.get("PROPAINTER_RESIZE_RATIO") or 1.0)
-            if resize_ratio > 0 and resize_ratio != 1.0:
-                command.extend(["--resize_ratio", str(resize_ratio)])
-            if str(os.environ.get("PROPAINTER_FP16") or "1").strip().lower() in {"1", "true", "yes", "on"}:
-                command.append("--fp16")
-            proc = subprocess.run(command, cwd=str(root / "ProPainter"), capture_output=True,
-                                  text=True, timeout=timeout, check=False)
-            candidate = render_dir / source_path.stem / "inpaint_out.mp4"
-            if proc.returncode != 0 or not candidate.exists():
-                failure_reason = None
-                if proc.returncode == 3221225477:
-                    failure_reason = (
-                        "ProPainter process terminated with Windows access-violation "
-                        "(0xC0000005); check the selected accelerator runtime and memory"
+                per_track_mask_dirs: dict[str, Path] = {}
+                per_track_mask_frames: dict[str, int] = {}
+                for track_index, track in enumerate(tracks, 1):
+                    key = str(track.get("track_id") or track.get("cluster_id") or track_index)
+                    if int((combined_mask.get("track_mask_frames") or {}).get(key) or 0) <= 0:
+                        continue
+                    track_dir = segment_dir / f"track-mask-{track_index:03d}"
+                    track_mask_info = _write_frame_masks(
+                        segment_path, track_dir, [track], template_path=template_value or None,
+                        dilation=max(0, min(8, selected_dilation)), mask_mode=selected_mask_mode,
+                        excluded_intervals=excluded_intervals, time_offset_seconds=offset_seconds,
                     )
-                return {"ok": False, "status": "propainter_failed", "backend": backend,
-                        "return_code": proc.returncode, "stderr": proc.stderr[-4000:],
-                        "stdout": proc.stdout[-2000:], "reason": failure_reason,
-                        "mask": mask_info,
-                        "track_receipts": mask_info.get("track_mask_frames") or {}}
+                    per_track_mask_dirs[key] = track_dir
+                    per_track_mask_frames[key] = int(
+                        (track_mask_info.get("track_mask_frames") or {}).get(key) or 0
+                    )
+                render_dir = segment_dir / "render"
+                command = [os.environ.get("PROPAINTER_PYTHON") or "python", str(root / "ProPainter" / "inference_propainter.py"),
+                           "--video", str(segment_path), "--mask", str(combined_mask_dir), "--output", str(render_dir),
+                           "--subvideo_length", str(subvideo_length),
+                           # The upstream script defaults to a four-pixel mask
+                           # dilation, but the final source-size compositor
+                           # previously copied only the undilated authoritative
+                           # mask. Tell the worker to preserve exactly the same
+                           # mask support it receives, so generated pixels are
+                           # not discarded at the handoff boundary.
+                           "--mask_dilation", "0"]
+                # On lower-VRAM devices ProPainter runs at a bounded inference
+                # size, then its candidate is restored to source dimensions
+                # before generated pixels are copied only inside verified masks.
+                # The delivered video therefore retains its original geometry.
+                if processing_profile["scaled"]:
+                    command.extend([
+                        "--width", str(processing_width),
+                        "--height", str(processing_height),
+                    ])
+                if str(os.environ.get("PROPAINTER_FP16") or "1").strip().lower() in {"1", "true", "yes", "on"}:
+                    command.append("--fp16")
+                proc = subprocess.run(command, cwd=str(root / "ProPainter"), capture_output=True, text=True, timeout=timeout, check=False)
+                candidate = render_dir / segment_path.stem / "inpaint_out.mp4"
+                if proc.returncode != 0 or not candidate.is_file() or candidate.stat().st_size <= 1024:
+                    return {"ok": False, "status": "propainter_failed", "backend": backend, "return_code": proc.returncode,
+                            "stderr": proc.stderr[-4000:], "stdout": proc.stdout[-2000:],
+                            "reason": "segment_gpu_process_failed", "mask": combined_mask}
+                candidate_cap = cv2.VideoCapture(str(candidate))
+                try:
+                    candidate_frames = int(candidate_cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+                    candidate_width = int(candidate_cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
+                    candidate_height = int(candidate_cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
+                finally:
+                    candidate_cap.release()
+                expected_segment_frames = end_frame - start_frame + 1
+                if (
+                    candidate_frames != expected_segment_frames
+                    or candidate_width != processing_width
+                    or candidate_height != processing_height
+                ):
+                    return {"ok": False, "status": "segment_output_metadata_mismatch", "backend": backend,
+                            "expected_frames": expected_segment_frames,
+                            "actual_frames": candidate_frames,
+                            "expected_dimensions": [processing_width, processing_height],
+                            "actual_dimensions": [candidate_width, candidate_height],
+                            "mask": combined_mask,
+                            "processing_profile": processing_profile}
+                segment_records.append({
+                    "start_frame": start_frame,
+                    "end_frame": end_frame,
+                    "candidate": candidate,
+                    "mask": combined_mask,
+                    "per_track_mask_dirs": per_track_mask_dirs,
+                    "per_track_mask_frames": per_track_mask_frames,
+                    "output_frame_count": candidate_frames,
+                })
+            composite_video = temp_dir / "composited-video.mp4"
+            writer = cv2.VideoWriter(str(composite_video), cv2.VideoWriter_fourcc(*"mp4v"), fps, (width, height))
+            if not writer.isOpened():
+                return {"ok": False, "status": "composite_writer_unavailable", "backend": backend}
+            source_reader = cv2.VideoCapture(str(source_path))
+            active_index = 0
+            repair_reader: Optional[cv2.VideoCapture] = None
+            try:
+                for frame_index in range(frame_count):
+                    ok, source_frame = source_reader.read()
+                    if not ok or source_frame is None:
+                        return {"ok": False, "status": "composite_source_read_failed", "backend": backend}
+                    while active_index < len(segment_records) and frame_index > segment_records[active_index]["end_frame"]:
+                        if repair_reader is not None:
+                            repair_reader.release()
+                            repair_reader = None
+                        active_index += 1
+                    output_frame = source_frame
+                    if active_index < len(segment_records):
+                        record = segment_records[active_index]
+                        if record["start_frame"] <= frame_index <= record["end_frame"]:
+                            if repair_reader is None:
+                                repair_reader = cv2.VideoCapture(str(record["candidate"]))
+                            repaired_ok, repaired_frame = repair_reader.read()
+                            if not repaired_ok or repaired_frame is None:
+                                return {"ok": False, "status": "segment_output_frame_mismatch", "backend": backend}
+                            if repaired_frame.shape[:2] != source_frame.shape[:2]:
+                                repaired_frame = cv2.resize(
+                                    repaired_frame,
+                                    (source_frame.shape[1], source_frame.shape[0]),
+                                    interpolation=cv2.INTER_CUBIC,
+                                )
+                            if repaired_frame.shape != source_frame.shape:
+                                return {
+                                    "ok": False,
+                                    "status": "segment_output_frame_mismatch",
+                                    "backend": backend,
+                                    "source_dimensions": [source_frame.shape[1], source_frame.shape[0]],
+                                    "candidate_dimensions": [repaired_frame.shape[1], repaired_frame.shape[0]],
+                                    "processing_profile": processing_profile,
+                                }
+                            # Do not replace a whole ProPainter segment: video
+                            # decoding/encoding can alter clean pixels outside
+                            # the approved support. Only copy generated pixels
+                            # covered by the authoritative per-track masks.
+                            output_frame = source_frame.copy()
+                            local_index = frame_index - int(record["start_frame"])
+                            for key, mask_dir in record["per_track_mask_dirs"].items():
+                                track_mask = cv2.imread(
+                                    str(mask_dir / f"{local_index:06d}.png"),
+                                    cv2.IMREAD_GRAYSCALE,
+                                )
+                                if track_mask is None or not np.any(track_mask):
+                                    continue
+                                approved = track_mask >= 128
+                                before = source_frame[approved]
+                                generated = repaired_frame[approved]
+                                changed = int(np.count_nonzero(np.any(before != generated, axis=1)))
+                                output_frame[approved] = generated
+                                track_output_frames[key] += 1
+                                if changed > 0:
+                                    track_receipts[key] += 1
+                                    changed_pixels_by_track[key] += changed
+                    writer.write(output_frame)
+            finally:
+                source_reader.release()
+                writer.release()
+                if repair_reader is not None:
+                    repair_reader.release()
+            ffmpeg = shutil.which("ffmpeg")
+            if not ffmpeg:
+                return {"ok": False, "status": "ffmpeg_required_for_audio_preservation", "backend": backend}
             output_path.parent.mkdir(parents=True, exist_ok=True)
-            output_path.write_bytes(candidate.read_bytes())
-            if output_path.stat().st_size < 1024:
-                return {"ok": False, "status": "invalid_output", "backend": backend, "mask": mask_info,
-                        "track_receipts": mask_info.get("track_mask_frames") or {}}
-            # ProPainter's CLI gives us an output file, but not a per-track
-            # pixel-application receipt. Mask generation must never be exposed
-            # as proof that the repair was applied; the outer QA gate will
-            # reject this result until a verified receipt exists.
-            return {"ok": False, "status": "completed_unverified", "backend": backend,
-                    "output_path": str(output_path), "track_count": len(tracks), "mask": mask_info,
-                    "track_receipts": {}, "receipt_kind": "mask_generated_only"}
+            # Do not capture FFmpeg pipes: a long diagnostic stream can fill a
+            # PIPE buffer and block the worker before it can finish the mux.
+            # Preserve the source audio only for the actual repaired-video
+            # duration. A malformed source may carry a much longer audio track;
+            # copying that track without a hard ``-t`` creates a long silent
+            # tail and makes the production compositor see the wrong duration.
+            video_duration_seconds = frame_count / max(1e-6, fps)
+            mux = subprocess.run(
+                [ffmpeg, "-y", "-i", str(composite_video), "-i", str(source_path),
+                 "-map", "0:v:0", "-map", "1:a?", "-c:v", "libx264",
+                 "-preset", "veryfast", "-crf", "18", "-c:a", "aac",
+                 "-t", f"{video_duration_seconds:.6f}", "-shortest",
+                 str(output_path)],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                timeout=600, check=False,
+            )
+            if mux.returncode != 0 or not output_path.is_file() or output_path.stat().st_size <= 1024:
+                output_path.unlink(missing_ok=True)
+                return {"ok": False, "status": "audio_mux_failed", "backend": backend,
+                        "return_code": mux.returncode}
+            expected_track_mask_frames = {
+                key: sum(
+                    int(record["per_track_mask_frames"].get(key) or 0)
+                    for record in segment_records
+                )
+                for key in track_receipts
+            }
+            eligible_track_ids = [
+                key for key, expected in expected_track_mask_frames.items()
+                if expected > 0
+            ]
+            receipt_pass = bool(eligible_track_ids) and all(
+                track_output_frames[key] == expected_track_mask_frames[key]
+                and track_receipts[key] > 0
+                and changed_pixels_by_track[key] > 0
+                for key in eligible_track_ids
+            )
+            if not receipt_pass:
+                # The caller must never discover a residual-failed partial file
+                # at the requested output path and mistake it for an approved
+                # repair artifact.
+                output_path.unlink(missing_ok=True)
+            return {"ok": bool(receipt_pass), "status": "completed" if receipt_pass else "repair_not_applied", "backend": backend,
+                    "output_path": str(output_path) if receipt_pass else None,
+                    "frames": frame_count, "track_count": len(tracks),
+                    "mask": {"fps": fps, "frame_count": frame_count, "width": width, "height": height,
+                             "mask_mode": selected_mask_mode,
+                             "track_mask_frames": expected_track_mask_frames,
+                             "output_covered_mask_frames": track_output_frames,
+                             "segment_count": len(segment_records),
+                             "segment_frame_limit": segment_frame_limit,
+                             "processing_profile": processing_profile,
+                             "segments": [
+                                 {"start_frame": x["start_frame"], "end_frame": x["end_frame"],
+                                  "output_frame_count": x["output_frame_count"]}
+                                 for x in segment_records
+                             ]},
+                    "track_receipts": track_receipts, "changed_pixels_by_track": changed_pixels_by_track,
+                    "receipt_kind": "generated_output_mask_pixel_delta", "eligible_track_ids": eligible_track_ids,
+                    "segment_count": len(segment_records), "subvideo_length": subvideo_length,
+                    "processing_profile": processing_profile}
+        except subprocess.TimeoutExpired:
+            output_path.unlink(missing_ok=True)
+            return {"ok": False, "status": "propainter_timeout", "backend": backend}
         except Exception as exc:
+            output_path.unlink(missing_ok=True)
             return {"ok": False, "status": "worker_exception", "backend": backend, "error": str(exc)}

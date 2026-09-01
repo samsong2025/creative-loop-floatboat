@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import csv
 import difflib
@@ -19814,25 +19814,10 @@ def _replacement_plan_sync(
                     "handler": "fixed_banner_replace",
                     "placement": placement,
                     "bbox": bbox,
-                    "source_full_cover_bbox": _expand_bbox_ratio(
-                        bbox, width, height, 0.12, 0.16,
+                    "active_segments": _fixed_active_segments_for_layer(
+                        layer,
+                        source_rel,
                     ),
-                    "active_segments": [
-                        {
-                            **segment,
-                            "source_full_cover_bbox": _expand_bbox_ratio(
-                                segment.get("bbox") or bbox,
-                                width,
-                                height,
-                                0.12,
-                                0.16,
-                            ),
-                        }
-                        for segment in _fixed_active_segments_for_layer(
-                            layer,
-                            source_rel,
-                        )
-                    ],
                     "strategy": strategy,
                     "replacement_content": {
                         "product_name": profile[
@@ -22792,25 +22777,10 @@ def _replacement_plan_sync(
                     "handler": handler,
                     "placement": placement,
                     "bbox": bbox,
-                    "source_full_cover_bbox": _expand_bbox_ratio(
-                        bbox, width, height, 0.12, 0.16,
+                    "active_segments": _fixed_active_segments_for_layer(
+                        layer,
+                        source_rel,
                     ),
-                    "active_segments": [
-                        {
-                            **segment,
-                            "source_full_cover_bbox": _expand_bbox_ratio(
-                                segment.get("bbox") or bbox,
-                                width,
-                                height,
-                                0.12,
-                                0.16,
-                            ),
-                        }
-                        for segment in _fixed_active_segments_for_layer(
-                            layer,
-                            source_rel,
-                        )
-                    ],
                     "strategy": strategy,
                     "replacement_content": {
                         "product_name": profile[
@@ -37119,39 +37089,17 @@ def _fallback_semantic_brand_segments(semantic_report, duration_override: float 
     ]
     if len(interior) >= 2:
         times = [float(item.get("time_seconds") or 0.0) for item in interior]
-        candidate_duration = max(times) - min(times) + 3.0
-        # A persistent CTA banner can score as promo throughout narrative story
-        # footage. A fallback candidate must remain bounded and visually
-        # interstitial; it may never turn a subtitle-heavy story span into a
-        # destructive mid-promo proposal.
-        narrative_activity = [
-            float(
-                (item.get("text_layer_activity") or {}).get(
-                    "narrative_subtitle_activity"
-                )
-                or 0.0
-            )
-            for item in interior
-        ]
-        narrative_story_ratio = (
-            sum(value >= 0.50 for value in narrative_activity) / len(narrative_activity)
-            if narrative_activity else 1.0
-        )
-        if (
-            max(times) - min(times) >= 2.0
-            and 4.0 <= candidate_duration <= 40.0
-            and narrative_story_ratio < 0.50
-        ):
+        if max(times) - min(times) >= 2.0:
             segments.insert(0, {
                 "segment_id": "fallback-interior-brand-promo",
                 "type": "mid_promo_candidate",
                 "status": "REVIEW",
                 "start_seconds": round(max(0.0, min(times) - 1.5), 3),
                 "end_seconds": round(min(duration, max(times) + 1.5), 3),
-                "duration_seconds": round(candidate_duration, 3),
+                "duration_seconds": round(max(times) - min(times) + 3.0, 3),
                 "start_source": "sustained_promo_score_backtrack",
                 "end_source": "sustained_promo_score_forward",
-                "fallback_reason": "bounded_interstitial_promo_evidence_without_semantic_episode",
+                "fallback_reason": "sustained_promo_visual_or_ocr_evidence_without_semantic_episode",
             })
     return segments
 
@@ -43766,11 +43714,14 @@ def _run_ffmpeg_checked(
     started = time.monotonic()
 
     try:
+        # FFmpeg emits normal encoding progress on stderr. Keeping either
+        # stream in an unread PIPE while polling can fill the OS pipe buffer
+        # and block a long render indefinitely.
         p = subprocess.Popen(
             command,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            text=False,
         )
     except Exception as exc:
         raise HTTPException(
@@ -43818,7 +43769,8 @@ def _run_ffmpeg_checked(
 
             time.sleep(0.35)
 
-        stdout, stderr = p.communicate()
+        p.wait()
+        stdout, stderr = "", ""
 
     except _OperatorTaskCancelled:
         try:
@@ -44494,231 +44446,6 @@ def _operator_fixed_action_vertical_zone(action, width=0, height=0):
     return "top"
 
 
-def _operator_action_requires_explicit_confirmation(action: dict[str, Any]) -> bool:
-    """Whether a destructive editorial action requires user confirmation.
-
-    A detected in-story interruption is evidence for a *review candidate*, not
-    authority to remove story.  Historical fallback code promoted candidates
-    from semantic/fullscreen scans to AUTO, which let a false positive delete a
-    perfectly valid story span and replace it with an own mid-promo.
-    """
-    if not isinstance(action, dict):
-        return False
-    if str(action.get("type") or "") != "mid_promo_replace":
-        return False
-    source_candidate = action.get("source_candidate") or {}
-    return not bool(
-        action.get("user_confirmed")
-        or source_candidate.get("user_confirmed")
-        or str(action.get("decision_source") or "")
-        == "user_review_confirmed_boundary"
-    )
-
-
-def _operator_plan_source_sha256(plan: dict[str, Any]) -> str:
-    """Return the source SHA-256 declared by the render plan."""
-    source = (plan or {}).get("source") or {}
-    identity = source.get("source_identity") or {}
-    for candidate in (
-        source.get("sha256"),
-        source.get("source_sha256"),
-        identity.get("sha256"),
-        identity.get("source_sha256"),
-        (plan or {}).get("source_sha256"),
-    ):
-        value = str(candidate or "").strip().casefold()
-        if re.fullmatch(r"[0-9a-f]{64}", value):
-            return value
-    return ""
-
-
-def _operator_midpromo_has_source_bound_confirmation(
-    action: dict[str, Any], plan: dict[str, Any]
-) -> bool:
-    """Require a matching SHA-256 for any destructive in-story replacement."""
-    if _operator_action_requires_explicit_confirmation(action):
-        return False
-    candidate = action.get("source_candidate") or {}
-    action_sha256 = str(
-        candidate.get("source_sha256") or action.get("source_sha256") or ""
-    ).strip().casefold()
-    plan_sha256 = _operator_plan_source_sha256(plan)
-    return bool(
-        re.fullmatch(r"[0-9a-f]{64}", action_sha256)
-        and plan_sha256
-        and action_sha256 == plan_sha256
-    )
-
-
-def _operator_validate_editorial_actions_for_render(
-    plan: dict[str, Any],
-    actions: list[dict[str, Any]],
-    *,
-    include_review_actions: bool,
-) -> None:
-    """Fail closed on destructive in-story replacements without source proof.
-
-    ``include_review_actions`` controls whether a reviewer may preview review
-    cards. It is not blanket consent to cut source-story footage. A Mid Promo
-    requires both an explicit user decision and the exact SHA-256 of the plan's
-    source; terminal end-card replacement follows its separate review path.
-    """
-    unconfirmed = [
-        action
-        for action in actions
-        if str(action.get("type") or "") == "mid_promo_replace"
-        and not _operator_midpromo_has_source_bound_confirmation(action, plan)
-    ]
-    if not unconfirmed:
-        return
-    raise HTTPException(
-        status_code=422,
-        detail={
-            "stage": "replacement_render_editorial_authorization",
-            "error": "mid_promo_requires_explicit_user_confirmation",
-            "message": (
-                "An in-story Mid Promo replacement cannot run from detector, "
-                "semantic, or fullscreen evidence alone. Keep the source story "
-                "and request an explicit user confirmation bound to this plan's "
-                "source SHA-256."
-            ),
-            "include_review_actions": bool(include_review_actions),
-            "unconfirmed_actions": [
-                {
-                    "action_id": action.get("action_id"),
-                    "status": action.get("status"),
-                    "start_seconds": action.get("start_seconds"),
-                    "end_seconds": action.get("end_seconds"),
-                    "decision_source": action.get("decision_source"),
-                    "action_source_sha256": str(
-                        ((action.get("source_candidate") or {}).get("source_sha256"))
-                        or action.get("source_sha256")
-                        or ""
-                    ),
-                }
-                for action in unconfirmed
-            ],
-            "source": (plan.get("source") or {}).get("relative_path"),
-            "plan_source_sha256": _operator_plan_source_sha256(plan),
-        },
-    )
-
-
-def _production_editorial_exclusion_intervals(
-    plan: dict[str, Any],
-    include_review_actions: bool = False,
-) -> list[tuple[float, float]]:
-    """Return only source ranges of editorial actions safe to execute.
-
-    Temporal repair must not skip an in-story range merely because a detector
-    proposed an unconfirmed Mid Promo. The same production approval gate is
-    used here and by the renderer.
-    """
-    intervals = []
-    for action in (plan or {}).get("actions") or []:
-        if action.get("type") not in {"mid_promo_replace", "end_card_replace"}:
-            continue
-        if not _operator_production_approved_action(action, include_review_actions):
-            continue
-        try:
-            start = float(action.get("start_seconds", 0.0))
-            end = float(action.get("end_seconds", 0.0))
-        except (TypeError, ValueError):
-            continue
-        if 0.0 <= start < end:
-            intervals.append((start, end))
-    return intervals
-
-
-def _operator_fixed_full_cover_bbox(
-    action: dict[str, Any],
-    width: int,
-    height: int,
-    *,
-    segment: Optional[dict[str, Any]] = None,
-) -> Optional[dict[str, int]]:
-    """Return only explicit full-source-cover geometry for a fixed layer.
-
-    A detector ``bbox`` describes the evidence it found; it cannot prove that a
-    neighbouring icon, wordmark, shadow or glow is also hidden. Do not promote
-    it to a full-cover contract implicitly. Planners must provide one of the
-    explicit fields below, and every fixed renderer consumes this same resolver.
-    """
-    if not isinstance(action, dict):
-        return None
-    for container in (segment or {}, action):
-        if not isinstance(container, dict):
-            continue
-        for key in ("source_full_cover_bbox", "full_cover_bbox"):
-            candidate = container.get(key)
-            if isinstance(candidate, dict) and candidate:
-                return _clip_bbox(candidate, int(width), int(height))
-    return None
-
-
-def _operator_fixed_action_has_full_cover_contract(
-    action: dict[str, Any],
-    width: int,
-    height: int,
-) -> bool:
-    """Check that a fixed layer has a usable source-cover contract.
-
-    The renderer may draw a replacement label, but that is not proof the source
-    logo is hidden.  Production plans must carry a cover geometry equal to or
-    larger than the observed source footprint so a visual overlay cannot sit
-    beside the old icon/wordmark.
-    """
-    cover = _operator_fixed_full_cover_bbox(action, width, height)
-    source = action.get("bbox") or {}
-    if not cover or not isinstance(source, dict):
-        return False
-    try:
-        cx0, cy0 = float(cover["x"]), float(cover["y"])
-        cx1 = cx0 + float(cover["width"])
-        cy1 = cy0 + float(cover["height"])
-        sx0, sy0 = float(source["x"]), float(source["y"])
-        sx1 = sx0 + float(source["width"])
-        sy1 = sy0 + float(source["height"])
-    except (KeyError, TypeError, ValueError):
-        return False
-    return cx0 <= sx0 and cy0 <= sy0 and cx1 >= sx1 and cy1 >= sy1
-
-
-def _operator_validate_fixed_cover_actions(
-    actions: list[dict[str, Any]],
-    width: int,
-    height: int,
-) -> None:
-    """Refuse a render that would claim a fixed mark was treated without cover."""
-    invalid = []
-    for action in actions:
-        if action.get("type") != "fixed_brand_overlay":
-            continue
-        if not _operator_fixed_action_has_full_cover_contract(action, width, height):
-            invalid.append(
-                {
-                    "action_id": action.get("action_id"),
-                    "placement": action.get("placement"),
-                    "bbox": action.get("bbox"),
-                    "source_full_cover_bbox": action.get("source_full_cover_bbox"),
-                }
-            )
-    if invalid:
-        raise HTTPException(
-            status_code=422,
-            detail={
-                "stage": "replacement_render_fixed_cover_contract",
-                "error": "fixed_watermark_full_cover_geometry_required",
-                "message": (
-                    "A fixed watermark action lacks a full source-cover bbox. "
-                    "Rendering is rejected instead of drawing own branding next "
-                    "to an exposed competitor icon or wordmark."
-                ),
-                "invalid_actions": invalid,
-            },
-        )
-
-
 def _replacement_render_sync(
     req: BrandingReplacementRenderRequest
 ):
@@ -44790,26 +44517,44 @@ def _replacement_render_sync(
     actions = []
 
     for action in plan.get("actions") or []:
-        if (
-            action.get("status") == "REVIEW"
-            and not req.include_review_actions
+        if not _operator_production_approved_action(
+            action,
+            bool(req.include_review_actions),
         ):
             continue
 
         actions.append(action)
 
-    # A Mid Promo deletes in-story source material. A detector candidate or a
-    # request to include REVIEW cards is not authorization to perform that
-    # destructive edit, so reject before writing any intermediate media.
-    _operator_validate_editorial_actions_for_render(
-        plan,
-        actions,
-        include_review_actions=bool(req.include_review_actions),
-    )
-
-    # Rendering an own label is not proof that a fixed competitor lockup is
-    # hidden. Require its measured full source-cover geometry up front.
-    _operator_validate_fixed_cover_actions(actions, width, height)
+    pending_transient_cta_actions = [
+        action
+        for action in (plan.get("actions") or [])
+        if str(action.get("handler") or "")
+        == "transient_competitor_cta_brand_cover"
+        and not _operator_production_approved_action(
+            action,
+            bool(req.include_review_actions),
+        )
+    ]
+    if pending_transient_cta_actions:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "stage": "replacement_render",
+                "error": "transient_competitor_cta_requires_visual_approval",
+                "message": (
+                    "A high-confidence, short in-story competitor CTA was detected. "
+                    "Rendering is blocked until its bounded local cover action is visually confirmed."
+                ),
+                "actions": [
+                    {
+                        "action_id": action.get("action_id"),
+                        "evidence": action.get("evidence") or {},
+                        "active_segments": action.get("active_segments") or [],
+                    }
+                    for action in pending_transient_cta_actions
+                ],
+            },
+        )
 
     top_actions = [
         action
@@ -44979,58 +44724,6 @@ def _replacement_render_sync(
                     "Moving watermark actions are present, but the dynamic "
                     "full-render pass resolved zero census tracks. Rendering "
                     "was stopped instead of silently omitting the watermark."
-                ),
-            },
-        )
-
-    missing_top_cover_receipts = [
-        action.get("action_id")
-        for action in top_actions
-        if not any(
-            str(receipt.get("action_id") or "")
-            == str(action.get("action_id") or "")
-            and int(receipt.get("frames_rendered") or 0) > 0
-            and bool(receipt.get("source_full_cover_bbox_used"))
-            for receipt in (visual_base_report.get("top_full_cover_receipts") or [])
-        )
-    ]
-    if missing_top_cover_receipts:
-        raise HTTPException(
-            status_code=422,
-            detail={
-                "stage": "replacement_render",
-                "error": "top_fixed_full_cover_receipt_missing",
-                "action_ids": missing_top_cover_receipts,
-                "message": (
-                    "A top fixed watermark action had no full-source-cover render "
-                    "receipt. Rendering is rejected rather than claiming the "
-                    "competitor lockup was hidden."
-                ),
-            },
-        )
-
-    missing_bottom_cover_receipts = [
-        action.get("action_id")
-        for action in bottom_actions
-        if not any(
-            str(receipt.get("action_id") or "")
-            == str(action.get("action_id") or "")
-            and int(receipt.get("frames_rendered") or 0) > 0
-            and bool(receipt.get("source_full_cover_bbox_used"))
-            for receipt in (visual_base_report.get("bottom_full_cover_receipts") or [])
-        )
-    ]
-    if missing_bottom_cover_receipts:
-        raise HTTPException(
-            status_code=422,
-            detail={
-                "stage": "replacement_render",
-                "error": "bottom_fixed_full_cover_receipt_missing",
-                "action_ids": missing_bottom_cover_receipts,
-                "message": (
-                    "A bottom fixed watermark action had no full-source-cover render "
-                    "receipt. Rendering is rejected rather than claiming the "
-                    "competitor lockup was hidden."
                 ),
             },
         )
@@ -46914,63 +46607,90 @@ def _operator_bottom_action_bbox_at_time(
     action,
     t,
     duration,
-    width=0,
-    height=0,
 ):
-    """Return active *explicit full-cover* geometry for a bottom action.
-
-    It is deliberately not a generic bbox helper: using a detector bbox here
-    made bottom validation and rasterization disagree, leaving source lockup
-    pixels exposed beside an own-brand banner.
-    """
-    segments = (action or {}).get("active_segments") or []
+    """Return the active bottom bbox at time t, or None when inactive."""
+    segments = (
+        (action or {}).get(
+            "active_segments"
+        )
+        or []
+    )
 
     if segments:
         for segment in segments:
             try:
-                start = float(segment.get("start_seconds") or 0.0)
-                end = float(segment.get("end_seconds") or start)
+                start = float(
+                    segment.get(
+                        "start_seconds"
+                    )
+                    or 0.0
+                )
+                end = float(
+                    segment.get(
+                        "end_seconds"
+                    )
+                    or start
+                )
             except Exception:
                 continue
-            if t >= start - 1e-3 and t <= end + 1e-3:
-                return _operator_fixed_full_cover_bbox(
-                    action,
-                    int(width),
-                    int(height),
-                    segment=segment,
+
+            if (
+                t >= start - 1e-3
+                and t <= end + 1e-3
+            ):
+                return (
+                    segment.get(
+                        "bbox"
+                    )
+                    or (action or {}).get(
+                        "bbox"
+                    )
                 )
         return None
 
     try:
-        start = float((action or {}).get("start_seconds") or 0.0)
+        start = float(
+            (action or {}).get(
+                "start_seconds"
+            )
+            or 0.0
+        )
     except Exception:
         start = 0.0
+
     try:
-        end = float((action or {}).get("end_seconds") or duration or 0.0)
+        end = float(
+            (action or {}).get(
+                "end_seconds"
+            )
+            or duration
+            or 0.0
+        )
     except Exception:
-        end = float(duration or 0.0)
+        end = float(
+            duration
+            or 0.0
+        )
+
     if end <= 0:
-        end = float(duration or 0.0)
-    if t < start - 1e-3 or (end > 0 and t > end + 1e-3):
+        end = float(
+            duration
+            or 0.0
+        )
+
+    if (
+        t < start - 1e-3
+        or (
+            end > 0
+            and t > end + 1e-3
+        )
+    ):
         return None
 
-    return _operator_fixed_full_cover_bbox(action, int(width), int(height))
-
-
-def _operator_bottom_action_cover_receipt(
-    action,
-    t,
-    duration,
-    width,
-    height,
-):
-    """Resolve the exact bottom cover used by the renderer for audit/QC."""
-    return _operator_bottom_action_bbox_at_time(
-        action,
-        t,
-        duration,
-        width,
-        height,
+    return (
+        (action or {}).get(
+            "bbox"
+        )
     )
 
 
@@ -47221,7 +46941,6 @@ def _render_visual_base_full(
     top_icon_asset_frames = 0
     top_product_text_frames = 0
     top_icon_treatments = {}
-    top_full_cover_receipts = {}
     top_product_name = str(
         profile.get("product_name") or ""
     ).strip()
@@ -47289,7 +47008,6 @@ def _render_visual_base_full(
 
     bottom_brand_cover_frames = 0
     bottom_brand_cover_applications = 0
-    bottom_full_cover_receipts = {}
 
     for track in dynamic_tracks:
         source = str(
@@ -47428,22 +47146,6 @@ def _render_visual_base_full(
                     ):
                         top_icon_asset_frames += 1
 
-                    for item in applied:
-                        action_id = str(item.get("action_id") or "unknown")
-                        receipt = top_full_cover_receipts.setdefault(
-                            action_id,
-                            {
-                                "action_id": action_id,
-                                "frames_rendered": 0,
-                                "source_full_cover_bbox_used": None,
-                            },
-                        )
-                        receipt["frames_rendered"] += 1
-                        if item.get("source_cover_bbox"):
-                            receipt["source_full_cover_bbox_used"] = item.get(
-                                "source_cover_bbox"
-                            )
-
                     if (
                         top_product_name
                         and str(
@@ -47511,8 +47213,6 @@ def _render_visual_base_full(
                             bottom_action,
                             t,
                             duration,
-                            width,
-                            height,
                         )
                     )
 
@@ -47539,17 +47239,6 @@ def _render_visual_base_full(
                         bottom_bbox,
                         profile,
                     )
-                    action_id = str(bottom_action.get("action_id") or "unknown")
-                    receipt = bottom_full_cover_receipts.setdefault(
-                        action_id,
-                        {
-                            "action_id": action_id,
-                            "frames_rendered": 0,
-                            "source_full_cover_bbox_used": bottom_bbox,
-                        },
-                    )
-                    receipt["frames_rendered"] += 1
-                    receipt["source_full_cover_bbox_used"] = bottom_bbox
                     bottom_applied += 1
                     bottom_regions.append(bottom_bbox)
 
@@ -47664,7 +47353,6 @@ def _render_visual_base_full(
         "top_icon_treatments": (
             top_icon_treatments
         ),
-        "top_full_cover_receipts": list(top_full_cover_receipts.values()),
         "top_product_name": (
             top_product_name
         ),
@@ -47736,7 +47424,6 @@ def _render_visual_base_full(
         "bottom_brand_cover_applications": (
             bottom_brand_cover_applications
         ),
-        "bottom_full_cover_receipts": list(bottom_full_cover_receipts.values()),
         "bottom_brand_treatment": "opaque_own_brand_banner",
         "diagonal_brand_cover": (
             diagonal_geometry
@@ -50328,19 +50015,7 @@ def _apply_top_brand_composition_render(
         # never rendered (or receipted) the configured icon asset.  That made a
         # technically valid MP4 fail the business QC as "competitor-brand
         # treatment was not actually rendered".
-        # A reviewed action can distinguish the source watermark footprint
-        # from the desired own-brand layout.  The earlier renderer used the
-        # source wordmark box as both.  For a left-side lockup such as
-        # ``[source icon][source wordmark]``, it consequently created the own
-        # icon *after* the text and left the original icon exposed.  Keep the
-        # own presentation slots explicit when a visual QC pass has calibrated
-        # them; otherwise retain the canonical fallback for ordinary plans.
-        reviewed_text_slot = action.get("own_text_bbox")
-        text_slot = (
-            _clip_bbox(reviewed_text_slot, width, height)
-            if isinstance(reviewed_text_slot, dict)
-            else action.get("_operator_canonical_text_slot")
-        )
+        text_slot = action.get("_operator_canonical_text_slot")
         if not text_slot:
             text_slot = _canonical_top_text_slot(action, width, height, req)
             if text_slot:
@@ -50350,47 +50025,25 @@ def _apply_top_brand_composition_render(
             # zero-frame QC receipt will safely reject it.
             continue
 
-        top_brand_mode = str(
-            getattr(req, "top_brand_mode", "auto") or "auto"
-        ).lower()
-        render_icon = top_brand_mode not in {"text_only"}
-        icon_slot = None
-        if render_icon:
-            reviewed_icon_slot = action.get("own_icon_bbox") or action.get("source_icon_bbox")
-            icon_slot = (
-                _clip_bbox(reviewed_icon_slot, width, height)
-                if isinstance(reviewed_icon_slot, dict)
-                else action.get("_operator_canonical_icon_slot")
+        icon_slot = action.get("_operator_canonical_icon_slot")
+        if not icon_slot:
+            icon_slot = _canonical_top_icon_slot(
+                text_slot,
+                placement,
+                width,
+                height,
+                req,
             )
-            if not icon_slot:
-                icon_slot = _canonical_top_icon_slot(
-                    text_slot,
-                    placement,
-                    width,
-                    height,
-                    req,
-                )
-                if icon_slot:
-                    action["_operator_canonical_icon_slot"] = icon_slot
-            if not icon_slot:
-                continue
+            if icon_slot:
+                action["_operator_canonical_icon_slot"] = icon_slot
+        if not icon_slot:
+            continue
 
-        # The full cover geometry is the visual contract for a fixed source
-        # lockup. Resolve and apply it before any own-brand drawing; never use a
-        # text-only detector bbox as a surrogate for an icon + wordmark lockup.
-        active_segment = _active_fixed_segment(
-            action.get("active_segments") or [],
-            float(t),
-        )
-        source_cover_bbox = _operator_fixed_full_cover_bbox(
-            action,
-            int(width),
-            int(height),
-            segment=active_segment,
-        )
-        source_cleanup_bbox = source_cover_bbox or base_bbox
+        # Reconstruct only the observed source wordmark footprint.  The icon
+        # gets a deliberately opaque own-brand plate below, which guarantees the
+        # competitor mark cannot bleed through transparent artwork.
         cleanup_bbox = _expand_bbox_ratio(
-            source_cleanup_bbox,
+            base_bbox,
             width,
             height,
             float(getattr(req, "top_text_cleanup_expand_x_ratio", 0.10)),
@@ -50402,44 +50055,34 @@ def _apply_top_brand_composition_render(
             padding=2,
             radius=3.0,
         )
-        if source_cover_bbox:
+
+        icon_cover_bbox = _strong_icon_cover_bbox(
+            icon_slot,
+            width,
+            height,
+            req,
+        )
+        if bool(getattr(req, "top_icon_strong_cover_enabled", True)):
             processed = _draw_opaque_icon_plate(
                 processed,
-                source_cover_bbox,
-                1.0,
-                0.0,
+                icon_cover_bbox,
+                float(getattr(req, "top_icon_cover_plate_alpha", 1.0)),
+                float(getattr(req, "top_icon_cover_plate_padding_ratio", 0.08)),
             )
-        icon_cover_bbox = None
-        icon_treatment = None
-        if render_icon:
-            icon_cover_bbox = _strong_icon_cover_bbox(
-                icon_slot,
-                width,
-                height,
-                req,
-            )
-            if bool(getattr(req, "top_icon_strong_cover_enabled", True)):
-                processed = _draw_opaque_icon_plate(
-                    processed,
-                    icon_cover_bbox,
-                    float(getattr(req, "top_icon_cover_plate_alpha", 1.0)),
-                    float(getattr(req, "top_icon_cover_plate_padding_ratio", 0.08)),
-                )
 
-            processed, icon_treatment = _draw_icon_into_canonical_slot(
-                processed,
-                icon_slot,
-                profile,
-                req,
-            )
-        if top_brand_mode != "logo_only":
-            processed = _draw_canonical_brand_text(
-                processed,
-                text_slot,
-                profile,
-                placement,
-                req,
-            )
+        processed, icon_treatment = _draw_icon_into_canonical_slot(
+            processed,
+            icon_slot,
+            profile,
+            req,
+        )
+        processed = _draw_canonical_brand_text(
+            processed,
+            text_slot,
+            profile,
+            placement,
+            req,
+        )
 
         applied.append(
             {
@@ -50459,7 +50102,6 @@ def _apply_top_brand_composition_render(
                 "canonical_text_slot": text_slot,
                 "icon_bbox": icon_slot,
                 "icon_cover_bbox": icon_cover_bbox,
-                "source_cover_bbox": source_cover_bbox,
                 "icon_treatment": icon_treatment,
                 "treatment": "source_cleanup_then_own_brand",
                 "canonical_layout": True,
@@ -50562,10 +50204,16 @@ def _replacement_render_sync(
     # Editorial source ranges are removed before delivery. Carry those exact
     # approved intervals into dynamic repair so we neither mask nor QA frames
     # that are replaced by a mid-promo or an own end-card.
-    editorial_processing_exclusions = _production_editorial_exclusion_intervals(
-        plan,
-        include_review_actions=bool(getattr(req, "include_review_actions", False)),
-    )
+    editorial_processing_exclusions = [
+        (float(action.get("start_seconds", 0.0)), float(action.get("end_seconds", 0.0)))
+        for action in (plan.get("actions") or [])
+        if action.get("type") in {"mid_promo_replace", "end_card_replace"}
+        and _operator_production_approved_action(
+            action,
+            bool(getattr(req, "include_review_actions", False)),
+        )
+        and float(action.get("end_seconds", 0.0)) >= float(action.get("start_seconds", 0.0))
+    ]
 
     if (
         bool(getattr(req, "dynamic_watermark_temporal_recovery_enabled", False))
@@ -50681,11 +50329,6 @@ def _replacement_render_sync(
                 source_icon_relative_path=source_identity.get("icon_relative_path"),
                 source_logo_relative_path=source_identity.get("logo_relative_path"),
                 recovery_strength=float(getattr(req, "dynamic_watermark_temporal_recovery_strength", 1.0)),
-                # Track-bounded bbox support is the production default. The
-                # reviewed template still provides identity/QA evidence, but a
-                # glyph-only mask cannot erase a translucent watermark body.
-                repair_mask_mode="bbox",
-                repair_mask_dilation=1,
                 # ProPainter is optional on the CPU/MX250 deployment.  The
                 # local trajectory clean-plate backend remains explicit in
                 # the report and is accepted only when residual QA passes;
@@ -52487,19 +52130,10 @@ def _validate_image_asset(
         return result
 
     h, w = image.shape[:2]
-    # A readable image can still be an uninitialized placeholder (for example
-    # a uniform mid-grey PNG). Treating it as a valid logo made a fixed cover
-    # look successful while drawing no recognizable own brand. This local check
-    # applies to every profile and does not rely on source-video geometry.
-    color = image[:, :, :3] if len(image.shape) == 3 else image
-    spatial_stddev = float(np.std(color))
-    flat_color = color.reshape(-1, color.shape[-1] if len(color.shape) == 3 else 1)
-    unique_color_count = int(len(np.unique(flat_color, axis=0)))
-    visually_empty = spatial_stddev < 1.0 or unique_color_count <= 1
 
     result.update(
         {
-            "valid": not visually_empty,
+            "valid": True,
             "width": int(w),
             "height": int(h),
             "channels": (
@@ -52511,17 +52145,8 @@ def _validate_image_asset(
                 len(image.shape) == 3
                 and image.shape[2] == 4
             ),
-            "visual_integrity": {
-                "valid": not visually_empty,
-                "spatial_stddev": round(spatial_stddev, 3),
-                "unique_color_count": unique_color_count,
-                "error": "image_visual_content_blank" if visually_empty else None,
-            },
         }
     )
-
-    if visually_empty:
-        result["error"] = "image_visual_content_blank"
 
     return result
 
@@ -66092,6 +65717,21 @@ class OperatorReviewRequest(BaseModel):
     item_ids: list[str] = Field(default_factory=list)
 
 
+class OperatorCtaVisualReviewRequest(BaseModel):
+    """Confirm or reject one bounded, in-story CTA cover before rendering."""
+
+    task_id: str
+    item_id: str
+    action_id: str
+    decision: str
+
+
+class OperatorCtaVisualReviewRecoveryRequest(BaseModel):
+    """Restore a legacy CTA-gated failed task to its required visual-review step."""
+
+    task_id: str
+
+
 class OperatorCancelRequest(BaseModel):
     task_id: str
 
@@ -66110,6 +65750,14 @@ class _OperatorTaskDiscarded(Exception):
     def __init__(self, reason, detail=None):
         super().__init__(str(reason))
         self.reason = str(reason)
+        self.detail = detail if isinstance(detail, dict) else {}
+
+
+class _OperatorCtaVisualReviewRequired(Exception):
+    """Pause one item at a local-cover proof instead of failing the whole task."""
+
+    def __init__(self, detail=None):
+        super().__init__("transient_competitor_cta_visual_review_required")
         self.detail = detail if isinstance(detail, dict) else {}
 
 
@@ -66361,7 +66009,10 @@ def _operator_progress_counts(
         if item.get(
             "status"
         )
-        == "AWAITING_REVIEW"
+        in (
+            "AWAITING_REVIEW",
+            "CTA_VISUAL_REVIEW",
+        )
     )
 
     uploaded = sum(
@@ -66538,7 +66189,10 @@ def _operator_refresh_progress(
                 )
             )
         )
-    elif status == "AWAITING_REVIEW":
+    elif status in (
+        "AWAITING_REVIEW",
+        "CTA_VISUAL_REVIEW",
+    ):
         percent = 82
     elif status == "UPLOADING":
         upload_done = (
@@ -72668,6 +72322,17 @@ def _operator_run_crawl(
                 "archived",
             )
 
+        # URL submissions may resolve entirely to formally archived SHA-duplicate
+        # sources. Schedule them just as newly downloaded sources; otherwise the
+        # task retains PENDING items and finalizes incorrectly.
+        if video_callback:
+            for video in videos:
+                if cancel_callback and cancel_callback():
+                    raise _OperatorTaskCancelled(
+                        "cancelled_before_processing_archived_video"
+                    )
+                video_callback(video)
+
         return {
             "primary_path": path,
             "primary_result": result,
@@ -74173,6 +73838,107 @@ def _operator_source_brand_detection_assets(source_context):
         "product_name": profile.get("product_name") or source_context.get("product_name"),
         "app_title": profile.get("app_title") or source_context.get("app_title"),
     }
+
+
+def _operator_prepare_cta_visual_review(
+    review_detail,
+):
+    """Render one bounded before/after preview for each blocked CTA action."""
+    detail = dict(review_detail or {})
+    plan_rel = str(detail.get("replacement_plan_relative_path") or "").strip()
+    if not plan_rel:
+        return detail
+
+    try:
+        _, plan = _read_json_workspace(plan_rel, "operator_cta_visual_review")
+        source_rel = str(((plan.get("source") or {}).get("relative_path") or "")).strip()
+        source_path = _safe_workspace_path(source_rel, must_exist=True)
+        cap = cv2.VideoCapture(str(source_path))
+        if not cap.isOpened():
+            raise RuntimeError("source_video_unreadable")
+        try:
+            meta = _video_metadata(cap)
+        finally:
+            cap.release()
+        width = int(meta.get("width") or 0)
+        height = int(meta.get("height") or 0)
+        fps = float(meta.get("fps") or 30.0)
+        duration = float(meta.get("duration_seconds") or 0.0)
+        profile = _operator_select_profile()
+        assets = profile.setdefault("assets", {})
+        latest = _find_profile_by_id(_load_replacement_registry(), profile.get("profile_id"))
+        if latest:
+            assets.update((latest.get("assets") or {}))
+
+        out_dir = (
+            WORKSPACE
+            / "review"
+            / "operator_cta_visual_review"
+            / _app_now().strftime("%Y-%m-%d_%H%M%S")
+            / source_path.stem
+        )
+        out_dir.mkdir(parents=True, exist_ok=True)
+        prepared = []
+        for raw_action in detail.get("actions") or []:
+            action_id = str(raw_action.get("action_id") or "").strip()
+            plan_action = next(
+                (
+                    candidate
+                    for candidate in (plan.get("actions") or [])
+                    if str(candidate.get("action_id") or "") == action_id
+                ),
+                None,
+            )
+            action = dict(plan_action or raw_action)
+            if not action_id or not action:
+                continue
+            segments = list(action.get("active_segments") or [])
+            segment = segments[0] if segments else {}
+            start = float(segment.get("start_seconds") or 0.0)
+            end = float(segment.get("end_seconds") or start)
+            center = max(0.0, min(duration, (start + end) / 2.0))
+            preview_seconds = max(1.0, min(2.0, (end - start) + 0.8))
+            output = out_dir / f"{action_id}.local-cover-compare.mp4"
+            preview = _render_fixed_banner_preview(
+                source_path,
+                output,
+                center,
+                preview_seconds,
+                action,
+                profile,
+                fps,
+                width,
+                height,
+                duration,
+                15,
+                "slow",
+            )
+            if not bool(preview.get("ok")) or not preview.get("relative_path"):
+                raise RuntimeError(
+                    "cta_cover_preview_render_failed: " + str(preview.get("error") or "unknown")
+                )
+            prepared.append(
+                {
+                    **raw_action,
+                    "preview": {
+                        **preview,
+                        "created_at": _app_now().isoformat(),
+                        "comparison_layout": "left=original,right=LOCAL COVER",
+                    },
+                }
+            )
+        if not prepared:
+            raise RuntimeError("cta_cover_preview_missing")
+        detail["actions"] = prepared
+        detail["visual_confirmation_ready"] = True
+        detail["visual_confirmation_prepared_at"] = _app_now().isoformat()
+        return detail
+    except Exception as exc:
+        return {
+            **detail,
+            "visual_confirmation_ready": False,
+            "visual_confirmation_error": str(exc)[:500],
+        }
 
 
 def _operator_select_profile():
@@ -75743,15 +75509,8 @@ def _operator_midpromo_actions(plan):
 
 def _operator_midpromo_user_boundary_override(plan, profile, source_context):
     """Use a user-confirmed boundary only for the matching source SHA-256."""
-    # Any existing detector/semantic candidate is merely evidence. Only a
-    # source-SHA-bound confirmation is allowed to prevent the explicit override
-    # from being considered, otherwise a stale REVIEW candidate can block the
-    # one authorized editorial action without being itself executable.
-    if any(
-        not _operator_action_requires_explicit_confirmation(action)
-        for action in _operator_midpromo_actions(plan)
-    ):
-        return {"used": False, "reason": "explicit_midpromo_action_already_present", "action_added": False}
+    if _operator_production_midpromo_actions(plan):
+        return {"used": False, "reason": "midpromo_action_already_present", "action_added": False}
 
     source_sha256 = str((source_context or {}).get("sha256") or "").casefold()
     source_rel = str((source_context or {}).get("relative_path") or "")
@@ -76095,7 +75854,7 @@ def _operator_midpromo_semantic_activity_fallback(
         {
             "action_id": "operator-midpromo-semantic-activity-fallback",
             "type": "mid_promo_replace",
-            "status": "REVIEW",
+            "status": "AUTO",
             "handler": "replace_mid_segment",
             "start_seconds": selected["start_seconds"],
             "end_seconds": selected["end_seconds"],
@@ -76109,7 +75868,6 @@ def _operator_midpromo_semantic_activity_fallback(
                 "type": "mid_promo_candidate",
                 "fallback": True,
                 "boundary_ready": True,
-                "requires_human_review": True,
                 "semantic_overlay_activity": selected,
                 "semantic_report_relative_path": (semantic or {}).get("report_relative_path"),
             },
@@ -76215,7 +75973,7 @@ def _operator_midpromo_recovery(plan, profile, router):
     action = {
         "action_id": "operator-midpromo-multimodal-fallback",
         "type": "mid_promo_replace",
-        "status": "REVIEW",
+        "status": "AUTO",
         "handler": "replace_mid_segment",
         "start_seconds": float(seg["start_seconds"]),
         "end_seconds": float(seg["end_seconds"]),
@@ -76228,7 +75986,6 @@ def _operator_midpromo_recovery(plan, profile, router):
         "source_candidate": {
             **seg,
             "fallback": True,
-            "requires_human_review": True,
             "segment_census_report_relative_path": report_rel,
         },
     }
@@ -76253,6 +76010,126 @@ def _operator_midpromo_recovery(plan, profile, router):
         )
 
     return plan["operator_midpromo_recovery"]
+
+
+def _operator_transient_cta_review_actions_from_census(
+    census,
+    width,
+    height,
+    duration,
+):
+    """Return bounded review actions for high-confidence in-story CTA hits.
+
+    A single OCR observation cannot authorize a moving own-brand overlay: it
+    may be dialogue, subtitle text, or an unrelated scene object.  It *is*,
+    however, evidence that a competitor CTA may survive the render.  Preserve
+    this evidence as a short, local REVIEW action so production is blocked
+    until it is explicitly approved instead of silently shipping the source
+    text.  The review action expands from the text line to its compact CTA
+    plate; it never targets terminal cards, browser chrome, or a full frame.
+    """
+    if width <= 0 or height <= 0 or duration <= 0:
+        return []
+    scan = (census or {}).get("scan") or {}
+    try:
+        interval = max(
+            0.25,
+            float(
+                scan.get("effective_interval_seconds")
+                or scan.get("requested_interval_seconds")
+                or 0.75
+            ),
+        )
+    except (TypeError, ValueError):
+        interval = 0.75
+
+    actions = []
+    for cluster in (census or {}).get("clusters") or []:
+        if str(cluster.get("classification") or "") != "moving_or_transient_candidate":
+            continue
+        if int(cluster.get("unique_time_count") or 0) != 1:
+            continue
+        hits = [
+            hit
+            for hit in _hits_for_cluster(census, cluster)
+            if not str(hit.get("target") or "").startswith("__")
+            and float(hit.get("similarity") or 0.0) >= 0.86
+            and float(hit.get("ocr_confidence") or 0.0) >= 0.82
+        ]
+        if not hits:
+            continue
+        hit = max(
+            hits,
+            key=lambda item: (
+                float(item.get("similarity") or 0.0),
+                float(item.get("ocr_confidence") or 0.0),
+            ),
+        )
+        bbox = hit.get("bbox") or {}
+        try:
+            text_time = float(hit.get("time_seconds") or 0.0)
+            raw = _clip_bbox(bbox, width, height)
+            center_x, center_y = _bbox_center(raw)
+            area_ratio = float(raw["width"] * raw["height"]) / float(width * height)
+        except Exception:
+            continue
+        # Restrict this guard to compact lower-story CTA plates. The source
+        # action is not applicable to headings, the persistent corner brand, or
+        # an end-card which has its own editorial replacement path.
+        if not (
+            0.52 * height <= center_y <= 0.86 * height
+            and 0.08 * width <= center_x <= 0.92 * width
+            and 0.0002 <= area_ratio <= 0.025
+            and 0.25 <= text_time <= duration - 3.0
+        ):
+            continue
+        horizontal_pad = int(round(raw["width"] * 0.40))
+        upper_pad = int(round(raw["height"] * 1.35))
+        lower_pad = int(round(raw["height"] * 2.65))
+        cover_bbox = _clip_bbox(
+            {
+                "x": raw["x"] - horizontal_pad,
+                "y": raw["y"] - upper_pad,
+                "width": raw["width"] + horizontal_pad * 2,
+                "height": raw["height"] + upper_pad + lower_pad,
+            },
+            width,
+            height,
+        )
+        start = max(0.0, text_time - max(0.30, min(0.60, interval * 0.40)))
+        end = min(duration, text_time + max(0.90, min(1.20, interval * 1.20)))
+        cluster_id = str(cluster.get("cluster_id") or "transient")
+        actions.append(
+            {
+                "action_id": f"operator-review-transient-cta-{cluster_id}",
+                "type": "fixed_brand_overlay",
+                "status": "REVIEW",
+                "handler": "transient_competitor_cta_brand_cover",
+                "placement": "bottom_center",
+                "bbox": cover_bbox,
+                "active_segments": [
+                    {
+                        "start_seconds": round(start, 3),
+                        "end_seconds": round(end, 3),
+                        "bbox": cover_bbox,
+                    }
+                ],
+                "strategy": "review_confirmed_local_competitor_cta_cover",
+                "decision_source": "high_confidence_singleton_in_story_competitor_cta",
+                "evidence": {
+                    "cluster_id": cluster_id,
+                    "observed_text": hit.get("observed_text"),
+                    "target": hit.get("target"),
+                    "time_seconds": round(text_time, 3),
+                    "similarity": round(float(hit.get("similarity") or 0.0), 4),
+                    "ocr_confidence": round(float(hit.get("ocr_confidence") or 0.0), 4),
+                    "text_bbox": raw,
+                    "cover_bbox": cover_bbox,
+                },
+                "operator_requires_visual_approval": True,
+            }
+        )
+    return actions
 
 
 def _operator_ensure_core_brand_actions(
@@ -76333,19 +76210,11 @@ def _operator_ensure_core_brand_actions(
             # remain review-only instead of being silently promoted to AUTO.
             action["handler"] = "top_cleanup_brand_overlay"
             action["bbox"] = bbox
-            action["source_full_cover_bbox"] = _expand_bbox_ratio(
-                action.get("source_full_cover_bbox") or bbox,
-                width,
-                height,
-                0.12,
-                0.16,
-            )
             action["active_segments"] = [
                 {
                     "start_seconds": 0.0,
                     "end_seconds": full_end,
                     "bbox": bbox,
-                    "source_full_cover_bbox": action["source_full_cover_bbox"],
                 }
             ]
             action["operator_force_full_story_span"] = True
@@ -76433,17 +76302,11 @@ def _operator_ensure_core_brand_actions(
                 "handler": "top_cleanup_brand_overlay",
                 "placement": placement,
                 "bbox": bbox,
-                "source_full_cover_bbox": _expand_bbox_ratio(
-                    bbox, width, height, 0.12, 0.16,
-                ),
                 "active_segments": [
                     {
                         "start_seconds": 0.0,
                         "end_seconds": full_end,
                         "bbox": bbox,
-                        "source_full_cover_bbox": _expand_bbox_ratio(
-                            bbox, width, height, 0.12, 0.16,
-                        ),
                     }
                 ],
                 "strategy": (
@@ -76497,23 +76360,50 @@ def _operator_ensure_core_brand_actions(
                 "handler": "bottom_cleanup_brand_overlay",
                 "placement": "bottom_right" if float(bbox.get("x") or 0) >= float(width) * 0.5 else "bottom_left",
                 "bbox": bbox,
-                "source_full_cover_bbox": _expand_bbox_ratio(
-                    bbox, width, height, 0.12, 0.16,
-                ),
-                "active_segments": [{
-                    "start_seconds": 0.0,
-                    "end_seconds": full_end,
-                    "bbox": bbox,
-                    "source_full_cover_bbox": _expand_bbox_ratio(
-                        bbox, width, height, 0.12, 0.16,
-                    ),
-                }],
+                "active_segments": [{"start_seconds": 0.0, "end_seconds": full_end, "bbox": bbox}],
                 "strategy": "operator_canonical_bottom_brand_full_story",
                 "decision_source": "watermark_router_fixed_strong_bottom",
                 "operator_force_full_story_span": True,
             }
             actions.append(action)
             added.append({"type": "fixed_brand_overlay", "source": action["decision_source"]})
+
+    existing_transient_cta_clusters = {
+        str(((action.get("evidence") or {}).get("cluster_id") or "") )
+        for action in actions
+        if str(action.get("handler") or "")
+        == "transient_competitor_cta_brand_cover"
+    }
+    transient_cta_actions = [
+        action
+        for action in _operator_transient_cta_review_actions_from_census(
+            census,
+            width,
+            height,
+            full_end,
+        )
+        if str(((action.get("evidence") or {}).get("cluster_id") or ""))
+        not in existing_transient_cta_clusters
+    ]
+    if transient_cta_actions:
+        actions.extend(transient_cta_actions)
+        added.extend(
+            {
+                "type": "fixed_brand_overlay",
+                "source": action["decision_source"],
+                "status": "REVIEW",
+            }
+            for action in transient_cta_actions
+        )
+
+    plan.setdefault("summary", {})[
+        "operator_transient_competitor_cta_review_count"
+    ] = sum(
+        1
+        for action in actions
+        if str(action.get("handler") or "")
+        == "transient_competitor_cta_brand_cover"
+    )
 
     # A terminal app-promo card can be visually distinct enough that OCR sees
     # no readable product text.  If semantic analysis already bounds the final
@@ -76710,19 +76600,6 @@ def _operator_production_approved_action(action, include_review=False):
     candidate = action.get("source_candidate") or {}
     if bool(candidate.get("requires_human_review")) and not bool(
         action.get("user_confirmed") or candidate.get("user_confirmed")
-    ):
-        return False
-    # A Mid Promo changes the source narrative. It is eligible only after the
-    # renderer's source-SHA-bound authorization gate validates it against the
-    # active plan; this helper remains conservative for planning/QC contexts.
-    if str(action.get("type") or "") == "mid_promo_replace" and (
-        _operator_action_requires_explicit_confirmation(action)
-        or not re.fullmatch(
-            r"[0-9a-f]{64}",
-            str(candidate.get("source_sha256") or action.get("source_sha256") or "")
-            .strip()
-            .casefold(),
-        )
     ):
         return False
     status = str(action.get("status") or "").upper()
@@ -77186,6 +77063,7 @@ def _operator_top_action_bbox(
 def _operator_process_video(
     video_entry,
     progress_callback=None,
+    confirmed_cta_action_ids=None,
 ):
     pipeline_started = time.monotonic()
     stage_timings = []
@@ -77883,16 +77761,11 @@ def _operator_process_video(
         dynamic_track_source_counts
     )
 
-    # Detector, OCR, semantic and fullscreen signals may create a review
-    # candidate, but no longer create an executable Mid Promo action in an
-    # unattended render. An in-story replacement deletes source footage and is
-    # therefore enabled only by a source-SHA-bound explicit user boundary.
-    existing_midpromo = _operator_production_midpromo_actions(plan)
-    if existing_midpromo:
+    if _operator_production_midpromo_actions(plan):
         midpromo_recovery = {
             "used": False,
-            "reason": "explicit_midpromo_action_present",
-            "candidate_count": len(existing_midpromo),
+            "reason": "semantic_midpromo_action_present",
+            "candidate_count": len(_operator_production_midpromo_actions(plan)),
             "action_added": False,
             "report_relative_path": None,
         }
@@ -77902,12 +77775,54 @@ def _operator_process_video(
             profile,
             source_context,
         )
+
+        # The legacy multimodal census is the slowest recovery branch after
+        # OCR.  Prefer the sequential fullscreen scan (which also hands its
+        # scene cuts to the semantic-activity recovery) and invoke the legacy
+        # census only when the fast route cannot identify a bounded segment.
         if not _operator_production_midpromo_actions(plan):
+            fullscreen_recovery = run_stage(
+                "midpromo_fullscreen_recovery",
+                "Mid Promo 语义未命中 · 快速检测全屏插播结构",
+                lambda: _operator_midpromo_fullscreen_insert_fallback(
+                    plan, profile, source_context, semantic
+                ),
+            )
             midpromo_recovery = {
                 **midpromo_recovery,
-                "automatic_detection_execution": "disabled_requires_explicit_user_confirmation",
-                "candidate_count": 0,
-                "action_added": False,
+                "fullscreen_insert_fallback": fullscreen_recovery,
+            }
+
+        if not _operator_production_midpromo_actions(plan):
+            activity_recovery = run_stage(
+                "midpromo_activity_recovery",
+                "Mid Promo 无 OCR 锚点 · 以画面活动与场景边界复核",
+                lambda: _operator_midpromo_semantic_activity_fallback(
+                    plan,
+                    profile,
+                    semantic,
+                    scene_cuts=(fullscreen_recovery or {}).get("scene_cuts"),
+                ),
+            )
+            midpromo_recovery = {
+                **midpromo_recovery,
+                "semantic_activity_fallback": activity_recovery,
+            }
+
+        if not _operator_production_midpromo_actions(plan):
+            # Do not turn an unbounded/uncertain interruption into a slow
+            # destructive edit.  The review UI retains the source and exposes
+            # the no-match reason; a user boundary override remains available
+            # for the exceptional case.  This removes the 4–5 minute legacy
+            # OCR/scene pass from the normal production path.
+            legacy_recovery = run_stage(
+                "midpromo_multimodal_recovery",
+                "Mid Promo targeted scene-boundary recovery",
+                lambda: _operator_midpromo_recovery(plan, profile, router),
+            )
+            midpromo_recovery = {
+                **midpromo_recovery,
+                "legacy_multimodal_fallback": legacy_recovery,
             }
 
     plan.setdefault("summary", {})["mid_promo_replace_count"] = len(
@@ -77922,6 +77837,54 @@ def _operator_process_video(
             json.dumps(plan, ensure_ascii=False, indent=2), encoding="utf-8"
         )
 
+    confirmed_cta_action_ids = {
+        str(value)
+        for value in (confirmed_cta_action_ids or [])
+        if str(value).strip()
+    }
+    transient_cta_actions = [
+        action
+        for action in (plan.get("actions") or [])
+        if str(action.get("handler") or "")
+        == "transient_competitor_cta_brand_cover"
+    ]
+    pending_cta_actions = [
+        action
+        for action in transient_cta_actions
+        if str(action.get("action_id") or "") not in confirmed_cta_action_ids
+    ]
+    if pending_cta_actions:
+        raise _OperatorCtaVisualReviewRequired(
+            {
+                "stage": "replacement_render",
+                "error": "transient_competitor_cta_requires_visual_approval",
+                "message": (
+                    "A high-confidence, short in-story competitor CTA needs "
+                    "visual confirmation before its bounded local cover is rendered."
+                ),
+                "replacement_plan_relative_path": plan.get("report_relative_path"),
+                "actions": [
+                    {
+                        "action_id": action.get("action_id"),
+                        "evidence": action.get("evidence") or {},
+                        "active_segments": action.get("active_segments") or [],
+                    }
+                    for action in pending_cta_actions
+                ],
+            }
+        )
+
+    for action in transient_cta_actions:
+        if str(action.get("action_id") or "") in confirmed_cta_action_ids:
+            action["user_confirmed"] = True
+            action["operator_requires_visual_approval"] = False
+
+    if plan.get("report_relative_path"):
+        _safe_workspace_path(plan["report_relative_path"]).write_text(
+            json.dumps(plan, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+
     production_req = (
         BrandingProductionCandidateRenderRequest(
             replacement_plan_relative_path=(
@@ -77929,6 +77892,9 @@ def _operator_process_video(
                     "report_relative_path"
                 ]
             ),
+            # A CTA confirmation must not also opt every unrelated REVIEW
+            # action into production.  The selected CTA is marked user_confirmed
+            # above and is accepted by the production approval predicate alone.
             include_review_actions=False,
             allow_placeholder_assets=False,
 
@@ -78967,6 +78933,28 @@ def _operator_task_worker(
                         item.update({"status": "DISCARDED", "processing_stage": "discarded", "processing_stage_label": "检测到斜向平铺水印，已跳过剪辑", "discard_reason": exc.reason, "discard_detail": exc.detail, "error": exc.detail or {"error": exc.reason}, "finished_at": _app_now().isoformat()})
                         _operator_refresh_progress(task)
                         _operator_write_job(path, task)
+                except _OperatorCtaVisualReviewRequired as exc:
+                    review_detail = _operator_prepare_cta_visual_review(exc.detail)
+                    with processing_state_lock:
+                        preview_ready = bool(review_detail.get("visual_confirmation_ready"))
+                        item.update({
+                            "status": "CTA_VISUAL_REVIEW" if preview_ready else "FAILED",
+                            "processing_stage": "cta_visual_review" if preview_ready else "cta_visual_preview_failed",
+                            "processing_stage_label": (
+                                "发现短时竞品 CTA，等待确认局部遮盖"
+                                if preview_ready
+                                else "CTA 局部遮盖预览生成失败"
+                            ),
+                            "cta_visual_review": review_detail,
+                            "error": None if preview_ready else {
+                                "stage": "operator_cta_visual_review",
+                                "error": "cta_cover_preview_not_ready",
+                                "message": review_detail.get("visual_confirmation_error") or "CTA cover preview was not created.",
+                            },
+                            "finished_at": None if preview_ready else _app_now().isoformat(),
+                        })
+                        _operator_refresh_progress(task)
+                        _operator_write_job(path, task)
                 except Exception as exc:
                     with processing_state_lock:
                         item.update({"status": "FAILED", "processing_stage": "failed", "processing_stage_label": "剪辑失败", "error": _operator_error_payload(exc), "finished_at": _app_now().isoformat()})
@@ -79698,6 +79686,7 @@ def _operator_task_worker(
             # the persisted item list when a callback races with crawl updates.
             final_items = list(task.get("items") or [])
             succeeded = sum(1 for item in final_items if item.get("status") == "AWAITING_REVIEW")
+            cta_review_pending = sum(1 for item in final_items if item.get("status") == "CTA_VISUAL_REVIEW")
             failed = sum(1 for item in final_items if item.get("status") == "FAILED")
             discarded = sum(1 for item in final_items if item.get("status") == "DISCARDED")
             task["summary"] = {
@@ -79707,6 +79696,7 @@ def _operator_task_worker(
                 "review_ready_count": (
                     succeeded
                 ),
+                "cta_visual_review_count": cta_review_pending,
                 "failed_count": (
                     failed
                 ),
@@ -79715,7 +79705,19 @@ def _operator_task_worker(
                 "rejected_count": 0,
             }
 
-            if succeeded:
+            if cta_review_pending:
+                task[
+                    "status"
+                ] = (
+                    "CTA_VISUAL_REVIEW"
+                )
+
+                task[
+                    "stage_label"
+                ] = (
+                    "发现短时竞品 CTA，等待确认局部遮盖"
+                )
+            elif succeeded:
                 task[
                     "status"
                 ] = (
@@ -80650,6 +80652,341 @@ def _operator_review_worker(
 
             except Exception:
                 pass
+
+
+
+def _operator_cta_visual_review_recover_sync(
+    req: OperatorCtaVisualReviewRecoveryRequest,
+):
+    """Recover older failed CTA-gated jobs into the new bounded-review state."""
+    with _OPERATOR_REVIEW_LOCK:
+        path, task = _operator_read_job(req.task_id)
+        recovered = 0
+        for item in task.get("items") or []:
+            error = item.get("error") or {}
+            detail = error.get("detail") if isinstance(error, dict) else {}
+            existing_review = item.get("cta_visual_review") or {}
+            is_legacy_failure = (
+                isinstance(detail, dict)
+                and detail.get("error") == "transient_competitor_cta_requires_visual_approval"
+            )
+            is_unrendered_rejection = (
+                str(item.get("status") or "") == "REJECTED"
+                and str(existing_review.get("error") or "")
+                == "transient_competitor_cta_requires_visual_approval"
+                and not item.get("processed_video_relative_path")
+                and not item.get("creative_md5")
+            )
+            if not is_legacy_failure and not is_unrendered_rejection:
+                continue
+            recovery_detail = detail if is_legacy_failure else existing_review
+            review_detail = _operator_prepare_cta_visual_review(
+                {
+                    **recovery_detail,
+                    "replacement_plan_relative_path": (
+                        recovery_detail.get("replacement_plan_relative_path")
+                        or item.get("replacement_plan_relative_path")
+                        or ""
+                    ),
+                }
+            )
+            # Historical exception payloads did not retain the plan path. Recover
+            # it from the newest planner artifact for this exact source only.
+            if not review_detail.get("visual_confirmation_ready"):
+                source_rel = str(item.get("source_video_relative_path") or "")
+                candidates = sorted(
+                    (WORKSPACE / "review" / "branding_replacement_plan").glob("**/*.replacement-plan.json"),
+                    key=lambda value: value.stat().st_mtime,
+                    reverse=True,
+                )
+                for candidate in candidates:
+                    try:
+                        payload = json.loads(candidate.read_text(encoding="utf-8"))
+                        if str(((payload.get("source") or {}).get("relative_path") or "")) != source_rel:
+                            continue
+                        review_detail = _operator_prepare_cta_visual_review(
+                            {
+                                **recovery_detail,
+                                "replacement_plan_relative_path": candidate.relative_to(WORKSPACE).as_posix(),
+                            }
+                        )
+                        break
+                    except Exception:
+                        continue
+            if not review_detail.get("visual_confirmation_ready"):
+                continue
+            if is_unrendered_rejection:
+                item.setdefault("cta_visual_review_history", []).append(
+                    {
+                        "decision": item.get("cta_visual_review_decision"),
+                        "reviewed_at": item.get("cta_visual_reviewed_at"),
+                        "reopened_at": _app_now().isoformat(),
+                        "reason": "reopened_for_explicit_user_confirmation_before_any_render_or_upload",
+                    }
+                )
+            item.update(
+                {
+                    "status": "CTA_VISUAL_REVIEW",
+                    "processing_stage": "cta_visual_review",
+                    "processing_stage_label": "发现短时竞品 CTA，等待确认局部遮盖",
+                    "cta_visual_review": review_detail,
+                    "error": None,
+                    "finished_at": None,
+                    "cta_visual_reviewed_at": None,
+                    "cta_visual_review_decision": None,
+                }
+            )
+            recovered += 1
+        if not recovered:
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "stage": "operator_cta_visual_review",
+                    "error": "no_recoverable_cta_visual_review",
+                    "message": "No CTA-gated item with a verified local-cover preview could be recovered.",
+                },
+            )
+        task["status"] = "CTA_VISUAL_REVIEW"
+        task["stage_label"] = "发现短时竞品 CTA，等待确认局部遮盖"
+        task["current_item_id"] = None
+        task["worker_active"] = False
+        task["finished_at"] = None
+        task.setdefault("summary", {})["cta_visual_review_count"] = recovered
+        task["summary"]["failed_count"] = sum(
+            1 for item in (task.get("items") or [])
+            if item.get("status") in {"FAILED", "UPLOAD_FAILED"}
+        )
+        _operator_refresh_progress(task)
+        _operator_write_job(path, task)
+        return {
+            "ok": True,
+            "task_id": req.task_id,
+            "recovered_count": recovered,
+            "message": "CTA visual review preview is ready; rendering and upload remain paused.",
+        }
+
+
+def _operator_cta_visual_review_sync(
+    req: OperatorCtaVisualReviewRequest,
+):
+    """Record a local CTA-cover decision and start the deferred production pass."""
+    decision = str(req.decision or "").strip().lower()
+    if decision not in {"approve", "reject"}:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "stage": "operator_cta_visual_review",
+                "error": "decision_must_be_approve_or_reject",
+            },
+        )
+
+    with _OPERATOR_REVIEW_LOCK:
+        path, task = _operator_read_job(req.task_id)
+        if str(task.get("status") or "") != "CTA_VISUAL_REVIEW":
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "stage": "operator_cta_visual_review",
+                    "error": "task_not_waiting_for_cta_visual_review",
+                    "status": task.get("status"),
+                },
+            )
+
+        item = next(
+            (
+                value
+                for value in (task.get("items") or [])
+                if str(value.get("item_id") or "") == str(req.item_id)
+            ),
+            None,
+        )
+        if item is None or str(item.get("status") or "") != "CTA_VISUAL_REVIEW":
+            raise HTTPException(
+                status_code=404,
+                detail={
+                    "stage": "operator_cta_visual_review",
+                    "error": "cta_visual_review_item_not_found",
+                    "item_id": req.item_id,
+                },
+            )
+
+        review = item.get("cta_visual_review") or {}
+        action = next(
+            (
+                value
+                for value in (review.get("actions") or [])
+                if str(value.get("action_id") or "") == str(req.action_id)
+            ),
+            None,
+        )
+        if action is None:
+            raise HTTPException(
+                status_code=404,
+                detail={
+                    "stage": "operator_cta_visual_review",
+                    "error": "cta_visual_review_action_not_found",
+                    "action_id": req.action_id,
+                },
+            )
+
+        if decision == "reject":
+            item.update(
+                {
+                    "status": "REJECTED",
+                    "processing_stage": "cta_visual_review_rejected",
+                    "processing_stage_label": "已拒绝局部 CTA 遮盖，素材不进入渲染",
+                    "cta_visual_reviewed_at": _app_now().isoformat(),
+                    "cta_visual_review_decision": "reject",
+                }
+            )
+            task["status"] = "COMPLETED_WITH_ERRORS"
+            task["stage_label"] = "局部 CTA 遮盖未获确认，素材未渲染"
+            task["finished_at"] = _app_now().isoformat()
+            task["worker_active"] = False
+            _operator_refresh_progress(task)
+            _operator_write_job(path, task)
+            return {
+                "ok": True,
+                "task_id": req.task_id,
+                "item_id": req.item_id,
+                "action_id": req.action_id,
+                "decision": decision,
+                "message": "CTA cover was rejected; the source was not rendered or uploaded.",
+            }
+
+        item.update(
+            {
+                "status": "PROCESSING",
+                "processing_stage": "cta_visual_review_approved",
+                "processing_stage_label": "局部 CTA 遮盖已确认，正在正式渲染",
+                "cta_visual_reviewed_at": _app_now().isoformat(),
+                "cta_visual_review_decision": "approve",
+            }
+        )
+        task["status"] = "PROCESSING"
+        task["stage_label"] = "局部 CTA 遮盖已确认，继续正式渲染"
+        task["current_item_id"] = item.get("item_id")
+        task["worker_active"] = True
+        _operator_refresh_progress(task)
+        _operator_write_job(path, task)
+
+    def resume() -> None:
+        _OPERATOR_THREAD_CONTEXT.task_id = str(req.task_id)
+        try:
+            entry = {
+                "relative_path": item.get("source_video_relative_path"),
+                "product_name": item.get("product_name"),
+                "language": item.get("language"),
+                "language_code": item.get("language_code"),
+                "sha256": item.get("source_sha256"),
+            }
+
+            def progress(stage_code, stage_label):
+                with _OPERATOR_REVIEW_LOCK:
+                    try:
+                        _, latest = _operator_read_job(req.task_id)
+                        latest_item = next(
+                            value
+                            for value in (latest.get("items") or [])
+                            if str(value.get("item_id") or "") == str(req.item_id)
+                        )
+                        latest_item["processing_stage"] = str(stage_code)
+                        latest_item["processing_stage_label"] = str(stage_label)
+                        latest_item["last_processing_update_at"] = _app_now().isoformat()
+                        latest["status"] = "PROCESSING"
+                        latest["stage_label"] = f"继续剪辑 {req.item_id} · {stage_label}"
+                        latest["current_item_id"] = req.item_id
+                        _operator_refresh_progress(latest)
+                        _operator_write_job(path, latest)
+                    except Exception:
+                        pass
+
+            processed = _operator_process_video(
+                entry,
+                progress_callback=progress,
+                confirmed_cta_action_ids=[req.action_id],
+            )
+            with _OPERATOR_REVIEW_LOCK:
+                _, latest = _operator_read_job(req.task_id)
+                latest_item = next(
+                    value
+                    for value in (latest.get("items") or [])
+                    if str(value.get("item_id") or "") == str(req.item_id)
+                )
+                latest_item.update(processed)
+                latest_item.update(
+                    {
+                        "status": "AWAITING_REVIEW",
+                        "processing_stage": "done",
+                        "processing_stage_label": "剪辑完成，等待成片审核",
+                        "finished_at": _app_now().isoformat(),
+                    }
+                )
+                latest["status"] = "AWAITING_REVIEW"
+                latest["stage_label"] = "剪辑完成，等待审核"
+                latest["current_item_id"] = None
+                latest["worker_active"] = False
+                latest.setdefault("summary", {})["video_count"] = len(latest.get("items") or [])
+                latest["summary"]["review_ready_count"] = sum(
+                    1 for value in (latest.get("items") or [])
+                    if value.get("status") == "AWAITING_REVIEW"
+                )
+                latest["summary"]["cta_visual_review_count"] = 0
+                latest["summary"]["failed_count"] = sum(
+                    1 for value in (latest.get("items") or [])
+                    if value.get("status") in {"FAILED", "UPLOAD_FAILED"}
+                )
+                _operator_refresh_progress(latest)
+                _operator_write_job(path, latest)
+        except Exception as exc:
+            with _OPERATOR_REVIEW_LOCK:
+                try:
+                    _, latest = _operator_read_job(req.task_id)
+                    latest_item = next(
+                        value
+                        for value in (latest.get("items") or [])
+                        if str(value.get("item_id") or "") == str(req.item_id)
+                    )
+                    latest_item.update(
+                        {
+                            "status": "FAILED",
+                            "processing_stage": "failed",
+                            "processing_stage_label": "CTA 确认后的渲染失败",
+                            "error": _operator_error_payload(exc),
+                            "finished_at": _app_now().isoformat(),
+                        }
+                    )
+                    latest["status"] = "FAILED"
+                    latest["stage_label"] = "CTA 确认后的渲染失败"
+                    latest["current_item_id"] = None
+                    latest["worker_active"] = False
+                    latest["finished_at"] = _app_now().isoformat()
+                    _operator_refresh_progress(latest)
+                    _operator_write_job(path, latest)
+                except Exception:
+                    pass
+        finally:
+            try:
+                delattr(_OPERATOR_THREAD_CONTEXT, "task_id")
+            except Exception:
+                pass
+            _operator_worker_unregister(req.task_id)
+
+    thread = threading.Thread(
+        target=resume,
+        daemon=True,
+        name="operator-cta-review-" + str(req.task_id),
+    )
+    _operator_worker_register(req.task_id, thread)
+    thread.start()
+    return {
+        "ok": True,
+        "task_id": req.task_id,
+        "item_id": req.item_id,
+        "action_id": req.action_id,
+        "decision": decision,
+        "message": "CTA cover confirmed. Production rendering resumed without upload.",
+    }
 
 
 def _operator_review_sync(
@@ -82042,6 +82379,7 @@ function statusLabel(status) {
     CRAWLING: '采集中',
     PROCESSING: '自动剪辑中',
     AWAITING_REVIEW: '等待审核',
+    CTA_VISUAL_REVIEW: 'CTA 局部遮盖待确认',
     UPLOADING: '上传中',
     CANCEL_REQUESTED: '正在取消',
     CANCELLED: '已取消',
@@ -82054,7 +82392,7 @@ function statusLabel(status) {
 }
 
 function statusClass(status) {
-  if (status === 'AWAITING_REVIEW') return 'review';
+  if (status === 'AWAITING_REVIEW' || status === 'CTA_VISUAL_REVIEW') return 'review';
   if (status === 'COMPLETED') return 'done';
   if (status === 'FAILED' || status === 'COMPLETED_WITH_ERRORS' || status === 'CANCELLED' || status === 'INTERRUPTED') return 'fail';
   return '';
@@ -82078,7 +82416,7 @@ function progressFor(task) {
     const done = items.filter(x => ['AWAITING_REVIEW','FAILED','UPLOADED','REJECTED','UPLOAD_FAILED'].includes(x.status)).length;
     return 35 + Math.round(45 * done / items.length);
   }
-  if (status === 'AWAITING_REVIEW') return 82;
+  if (status === 'AWAITING_REVIEW' || status === 'CTA_VISUAL_REVIEW') return 82;
   if (status === 'UPLOADING') return 92;
   if (status === 'CANCEL_REQUESTED') return 90;
   if (status === 'CANCELLED' || status === 'INTERRUPTED') return 100;
@@ -82600,8 +82938,70 @@ function taskHtml(task) {
       <div class="task-stage">${escapeHtml(task.task_id || '')}</div>
     </div>
     ${taskError ? `<div class="task-error">${escapeHtml(taskError)}</div>` : ''}
+    ${ctaVisualReviewHtml(task)}
     ${reviewHtml(task)}
   </div>`;
+}
+
+async function reviewCtaCover(taskId, itemId, actionId, decision) {
+  const confirmed = decision !== 'approve' || window.confirm(
+    '已查看原画与 LOCAL COVER 对比，确认仅在标示的短时局部区域替换竞品 CTA，并继续正式渲染吗？\n\n本操作不会上传素材。成片生成后仍需单独审核上传。'
+  );
+  if (!confirmed) return;
+
+  try {
+    await api('/console/api/task/cta-visual-review', {
+      method: 'POST',
+      body: JSON.stringify({
+        task_id: taskId,
+        item_id: itemId,
+        action_id: actionId,
+        decision
+      })
+    });
+    toast(decision === 'approve' ? '局部 CTA 遮盖已确认，正在正式渲染' : '已拒绝局部 CTA 遮盖，素材不会渲染或上传');
+    setTimeout(refreshTasks, 600);
+  } catch (e) {
+    toast('CTA 遮盖审核操作失败：' + e.message);
+  }
+}
+
+function ctaVisualReviewHtml(task) {
+  const items = (task.items || []).filter(item => item.status === 'CTA_VISUAL_REVIEW');
+  if (!items.length) return '';
+
+  return `<div class="review-wrap">${items.map(item => {
+    const review = item.cta_visual_review || {};
+    const actions = Array.isArray(review.actions) ? review.actions : [];
+    return actions.map(action => {
+      const evidence = action.evidence || {};
+      const segment = (action.active_segments || [])[0] || {};
+      const start = Number(segment.start_seconds ?? evidence.time_seconds ?? 0).toFixed(2);
+      const end = Number(segment.end_seconds ?? evidence.time_seconds ?? 0).toFixed(2);
+      const box = segment.bbox || evidence.cover_bbox || {};
+      const preview = action.preview || {};
+      const previewPath = preview.relative_path || '';
+      const previewSrc = previewPath
+        ? '/console/media?path=' + encodeURIComponent(previewPath) + '&v=' + encodeURIComponent(preview.created_at || '')
+        : '';
+      return `<div class="review-card cta-review-card">
+        <div class="review-name">需要确认：短时竞品 CTA 局部遮盖</div>
+        ${previewSrc
+          ? `<video controls playsinline preload="metadata" src="${previewSrc}"></video>
+             <div class="review-actions"><a class="secondary" href="${previewSrc}" target="_blank" rel="noopener">在新窗口查看原画 / LOCAL COVER 对比</a></div>`
+          : `<div class="task-error">局部遮盖预览尚未生成，不能确认或继续渲染。</div>`}
+        <div class="review-meta">
+          <div class="task-stage">识别文本：${escapeHtml(evidence.observed_text || evidence.target || '竞品 CTA')}</div>
+          <div class="task-stage">遮盖窗口：${escapeHtml(start)}s – ${escapeHtml(end)}s · 仅局部区域 ${escapeHtml(box.width || 0)} × ${escapeHtml(box.height || 0)} px</div>
+          <div class="task-stage">左侧为原画，右侧为 LOCAL COVER。确认后只执行该局部遮盖，随后进入正式渲染；成片完成后仍需另行审核上传。</div>
+          ${previewSrc ? `<div class="review-actions">
+            <button class="primary" onclick="reviewCtaCover('${escapeHtml(task.task_id)}','${escapeHtml(item.item_id)}','${escapeHtml(action.action_id)}','approve')">确认局部遮盖并继续渲染</button>
+            <button class="danger" onclick="reviewCtaCover('${escapeHtml(task.task_id)}','${escapeHtml(item.item_id)}','${escapeHtml(action.action_id)}','reject')">不处理该素材</button>
+          </div>` : ''}
+        </div>
+      </div>`;
+    }).join('');
+  }).join('')}</div>`;
 }
 
 async function review(taskId, decision, itemIds) {
@@ -83306,6 +83706,30 @@ def register_branding_routes(app):
         )
 
 
+    @app.post("/console/api/task/cta-visual-review/recover", include_in_schema=False)
+    async def creative_loop_operator_cta_visual_review_recover(
+        req: OperatorCtaVisualReviewRecoveryRequest,
+    ):
+        import asyncio
+
+        return await asyncio.to_thread(
+            _operator_cta_visual_review_recover_sync,
+            req,
+        )
+
+
+    @app.post("/console/api/task/cta-visual-review", include_in_schema=False)
+    async def creative_loop_operator_cta_visual_review(
+        req: OperatorCtaVisualReviewRequest,
+    ):
+        import asyncio
+
+        return await asyncio.to_thread(
+            _operator_cta_visual_review_sync,
+            req,
+        )
+
+
     @app.post("/console/api/task/cancel", include_in_schema=False)
     async def creative_loop_operator_task_cancel(
         req: OperatorCancelRequest
@@ -83364,19 +83788,21 @@ def register_branding_routes(app):
         except Exception:
             media_relative = ""
 
+        allowed_review_media = (
+            media_relative.lower().startswith("processed/")
+            or media_relative.lower().startswith("review/operator_cta_visual_review/")
+        )
         if (
             not media_path.is_file()
             or media_path.suffix.lower()
             != ".mp4"
-            or not media_relative.lower().startswith(
-                "processed/"
-            )
+            or not allowed_review_media
         ):
             raise HTTPException(
                 status_code=404,
                 detail=(
-                    "Processed review video not found. "
-                    "The final-review player never falls back to raw source media."
+                    "Processed review video or bounded CTA comparison preview was not found. "
+                    "The review player never falls back to raw source media."
                 ),
             )
 

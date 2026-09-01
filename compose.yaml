@@ -2,6 +2,10 @@ services:
   creative-loop-api:
     build:
       context: ./api
+      # The regular service uses the CPU/OpenCV-capable base image. The
+      # optional CUDA dependencies live in the separate `gpu` Dockerfile
+      # stage and must not be downloaded during a normal local rebuild.
+      target: base
     container_name: creative-loop-api
     restart: unless-stopped
     init: true
@@ -41,6 +45,14 @@ services:
       PROPAINTER_MASK_DILATION: ${PROPAINTER_MASK_DILATION:-2}
       PROPAINTER_SUBVIDEO_LENGTH: ${PROPAINTER_SUBVIDEO_LENGTH:-80}
       PROPAINTER_TIMEOUT_SECONDS: ${PROPAINTER_TIMEOUT_SECONDS:-3600}
+      # Preserve source geometry while keeping 8-10 GB GPUs below ProPainter's
+      # full-resolution VRAM requirement. Generated pixels are restored only
+      # within verified trajectory masks during the source-size composite.
+      PROPAINTER_LOW_VRAM_MAX_MB: ${PROPAINTER_LOW_VRAM_MAX_MB:-10240}
+      PROPAINTER_LOW_VRAM_LONG_EDGE: ${PROPAINTER_LOW_VRAM_LONG_EDGE:-768}
+      PROPAINTER_MAX_SEGMENT_FRAMES: ${PROPAINTER_MAX_SEGMENT_FRAMES:-24}
+      PROPAINTER_PROCESS_WIDTH: ${PROPAINTER_PROCESS_WIDTH:-}
+      PROPAINTER_PROCESS_HEIGHT: ${PROPAINTER_PROCESS_HEIGHT:-}
 
       SELENIUM_REMOTE_URL: http://insight-browser:4444
       INSIGHT_HOME_URL: https://data.insightrackr.com/
